@@ -58,19 +58,28 @@ class AgentIn(BaseModel):
 
 async def _validate_bindings(conn, bindings: list[dict]):
     for b in bindings or []:
-        btype, ref_id = b.get("type"), str(b.get("ref_id", ""))
+        btype, raw = b.get("type"), b.get("ref_id", "")
         if btype == "plugin":
-            if ref_id not in plugin_registry.PLUGIN_REGISTRY:
-                raise APIError(400, f"插件不存在: {ref_id}")
-        elif btype == "skill":
-            if not await db.fetchone(conn, "SELECT id FROM skills WHERE id=?", (ref_id,)):
-                raise APIError(400, f"skill 不存在: {ref_id}")
-        elif btype == "mcp":
-            if not await db.fetchone(conn, "SELECT id FROM mcp_servers WHERE id=?", (ref_id,)):
-                raise APIError(400, f"mcp server 不存在: {ref_id}")
-        elif btype == "rag":
-            if not await db.fetchone(conn, "SELECT id FROM rag_knowledge WHERE id=?", (ref_id,)):
-                raise APIError(400, f"rag 知识库不存在: {ref_id}")
+            # 插件绑定用插件名（字符串），保持 str 匹配
+            name = str(raw)
+            if name not in plugin_registry.PLUGIN_REGISTRY:
+                raise APIError(400, f"插件不存在: {name}")
+        elif btype in ("skill", "mcp", "rag"):
+            # ref_id 是 DB 整型主键（skills/mcp_servers/rag_knowledge.id，PG 为 BIGINT）：
+            # 统一安全整数转换（BUG-004）。PG(asyncpg) 严格校验 int 类型，传 str 会
+            # DataError→500；sqlite 类型亲和性会掩盖 str→int，导致双后端行为不一致。
+            # 非整数 → 400，整数 → 类型安全查询（WHERE id=<int>），双后端行为一致。
+            try:
+                rid = int(raw)
+            except (TypeError, ValueError):
+                raise APIError(400, f"{btype} 绑定 ref_id 必须为整数: {raw!r}")
+            table, label = {
+                "skill": ("skills", "skill"),
+                "mcp": ("mcp_servers", "mcp server"),
+                "rag": ("rag_knowledge", "rag 知识库"),
+            }[btype]
+            if not await db.fetchone(conn, f"SELECT id FROM {table} WHERE id=?", (rid,)):
+                raise APIError(400, f"{label} 不存在: {rid}")
         elif btype != "memory":
             raise APIError(400, f"未知绑定类型: {btype}")
 

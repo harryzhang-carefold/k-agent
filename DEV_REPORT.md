@@ -532,3 +532,83 @@ docker compose -f docker-compose.yml -f docker-compose.pg.yml up -d --build
 - 交下游：t_12b63ade（云天明，双模式回归测试）。
 
 > 说明：本任务只做开发 + 自测证据，**不做最终验收**（终审由褚岩做，双模式各起一次真实容器验证，不采信自测）。
+
+---
+
+# TASK-018 修复记录：BUG-004（PG 绑定 500）+ BUG-005（.env.example *** 污染）
+
+> 上游：TASK-016 判定 FAIL（BUG-004）；TASK-017 褚岩独立终审复现 BUG-004 并新发现 BUG-005。
+> 修复在 feature 分支 `db-dual-backend`，未 merge main（等复审 + 用户确认）。
+
+## BUG-004（P1，阻断 AC-3/AC-4）
+
+### 缺陷
+PG 模式（`DB_BACKEND=postgres`）下，**带 skill/mcp/rag 绑定**的 agent 创建/更新全 500：
+`asyncpg.exceptions.DataError: invalid input for query argument $1: '1' ('str' object cannot be
+interpreted as an integer)`。sqlite 模式正常（200/400）。
+
+### 根因
+`src/routers/api1.py::_validate_bindings` 把 `ref_id` 转 `str` 后传入 `WHERE id=?`。
+- sqlite 有**类型亲和性**（TEXT 比较时隐式转 int），掩盖了 str→int，碰巧能查到；
+- PG（asyncpg）**严格类型校验**，BIGINT 主键列收到 str 直接抛 `DataError` → 500。
+`agent_bindings.ref_id` 两后端都是 TEXT（存储层无碍），问题只在**查询参数类型**。
+
+### 修改（1 处，`02-development/src/routers/api1.py`）
+`_validate_bindings` 对 skill/mcp/rag 三类 ref_id 做**安全整数转换**（`int(ref_id)`，
+捕获 `TypeError`/`ValueError` → 400），用整型参数 `WHERE id=?`。plugin 绑定仍按字符串名
+匹配（语义不变，PLUGIN_REGISTRY 用名字）。三表查询合并为 `table,label` 映射表。
+效果：双后端行为完全一致（有效→200，无效/非整数→400）。
+
+### 自测（本地隔离容器 HTTP 黑盒，无 mock；证据 `05-temp/t018_selftest_evidence.md`）
+- **PG 模式**（隔离容器 `t018-pg-isolated` 54330 + 本地 app 8399）：
+  - 创建·有效 skill 绑定 → **200**（修复前 500）
+  - 创建·无效 skill 绑定(99999) → **400** "skill 不存在"（修复前 500）
+  - 创建·非整数 ref_id("abc") → **400** "ref_id 必须为整数"
+  - 更新·有效/无效 skill 绑定 → **200 / 400**
+  - mcp 有效/无效 → **200 / 400**；rag 有效/无效 → **200 / 400**
+- **sqlite 模式**（全新目录 8499）：同 9 用例 → 200/400 与 PG **逐项一致**。
+- **双后端一致性**：9 用例 sqlite 与 PG 全部相同（有效 200 / 无效 400）。
+- 约束终检：8081 网关 healthy（postgres 透传）/ 8099 线上 agp-app 未动（postgres）/
+  `src/data/agp.db` md5=28042b3f776bcddf4c719a570aebbdd6（与 TASK-017 基线一致）/ 哮喘系统 healthy。
+- 测试环境说明：隔离 PG 容器内 asyncpg pool 的 init 回调在该测试环境未生效（线上 pg-unified
+  同代码正常，TASK-017 AC-2 已 PASS），测试库用 `ALTER ROLE ... SET search_path` 固定 schema，
+  仅影响一次性测试库、不改代码。
+
+### 状态
+**已修复 + 自测 PASS**。交 t_a77f683b（云天明回归）。注意：线上 agp-app 仍是旧镜像
+（`agp-platform:1.2.0-dual`），修复代码在 git，**需重建镜像后才生效**（重建/回归属下游）。
+
+## BUG-005（P1，阻断 AC-1/AC-5）
+
+### 缺陷
+`src/.env.example` 第 9 行 `*** LLM_TIMEOUT=90`、第 16 行 `***` 含字面 `***`。
+`docker compose` 严格解析 env_file 直接失败：`line 9: unexpected character "*" in variable name`
+→ 默认（sqlite）容器化部署路径不可用。损坏先于 TASK-015（git 三提交同款）。
+
+### 修改（1 处，`02-development/src/.env.example`）
+- 第 9 行 `*** LLM_TIMEOUT=90` → `LLM_TIMEOUT=90`
+- 第 16 行 `***` → 删除（对齐 live `src/.env` 的空行结构）
+
+### 自测
+- 项目目录（真实 compose + .env）：`docker compose config --quiet` → **PARSE OK**
+- 干净目录复现（.env.example→.env 复制 + compose + Dockerfile）：`docker compose config --quiet`
+  → **PARSE OK**（TASK-017 复现路径，修复前报错）
+- 全仓复查：其余 `***` 仅 DESIGN/README/DEV_REPORT 的 `?token=***`（文档占位，任务书认定合理）
+  + gitignored 的 `src/.env.bak`（不入仓、不被 compose 读取）。无其他破坏可解析性的 `***`。
+
+### 状态
+**已修复 + 自测 PASS**。交 t_a77f683b（云天明回归）。
+
+## 改动文件（TASK-018，git 可查）
+- `02-development/src/routers/api1.py`（BUG-004）
+- `02-development/src/.env.example`（BUG-005）
+- `02-development/DEV_REPORT.md`（本记录）
+
+## 自测证据索引（均在 `05-temp/`，t018_*）
+| 文件 | 内容 |
+|---|---|
+| `t018_selftest_evidence.md` | BUG-004/005 完整自测证据（PG/sqlite 双后端一致性 + compose config） |
+| `t018_start_pg.sh` / `t018_pg_app.log` | 隔离 PG 模式 app 启动脚本 + 日志 |
+| `t018_start_sqlite.sh` / `t018_sqlite_app.log` | sqlite 模式 app 启动脚本 + 日志 |
+| `t018_pg_ddl.sql` / `t018_pg_init.sql` | 隔离 PG 容器 agp schema DDL（源自 postgres-unified 迁移） |
+| `t018_compose_check/` | 干净目录 compose config 验证副本 |
