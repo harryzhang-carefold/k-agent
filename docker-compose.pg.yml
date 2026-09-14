@@ -1,0 +1,17 @@
+# PG 模式叠加文件（TASK-015）：
+#   docker compose -f docker-compose.yml -f docker-compose.pg.yml up -d --build
+# 前提（.env 已配 DB_BACKEND=postgres + AGP_DB_PASSWORD；宿主已有 pg-unified 容器）：
+#   sg docker -c 'docker network inspect agp_default >/dev/null 2>&1 \
+#     || docker network create agp_default'
+# 该文件只声明外部网络，不重复基础服务的其余配置。
+
+name: agp
+
+services:
+  app:
+    networks:
+      - agp_default
+
+networks:
+  agp_default:
+    external: true

@@ -80,6 +80,7 @@ async def healthz():
         "status": "ok",
         "service": "ai-agent-platform",
         "port": S.PORT,
+        "db": dbmod.backend_info(),
         "llm": llm_detail,
         "memory_backend": memory.get_memory_backend().info(),
         "embedding": emb.backend_info(),

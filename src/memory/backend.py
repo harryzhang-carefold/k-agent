@@ -252,10 +252,16 @@ class LocalBackend(MemoryBackend):
         return [v for _, v in tree.in_order()]
 
     def info(self):
+        from core import db as dbmod
+        d = dbmod.backend_info()
+        store = (f"{'PostgreSQL' if d['backend'] == 'postgres' else 'SQLite'}"
+                 f"({d.get('schema', '')} schema, {d.get('host', '')}:{d.get('port', '')})"
+                 if d["backend"] == "postgres"
+                 else f"SQLite({d['path']})")
         return {
             "name": "local",
             "stub": False,
-            "store": f"PostgreSQL({S.DB_SCHEMA} schema, {S.DB_HOST}:{S.DB_PORT}) + in-memory B+ tree/property graph",
+            "store": f"{store} + in-memory B+ tree/property graph",
             "graph_nodes": self.graph.node_count(),
             "graph_edges": self.graph.edge_count(),
         }

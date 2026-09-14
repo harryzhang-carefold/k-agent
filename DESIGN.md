@@ -10,7 +10,7 @@
 | 框架 | FastAPI + uvicorn | 异步、WS 原生支持 |
 | HTTP 客户端 | httpx | 异步调用 OpenAI 兼容端点 |
 | 模型 | pydantic v2 | schema / critique-refine 校验 |
-| 持久化 | aiosqlite（`data/agp.db` 单文件） | DECISION-002，VM 无外部 DB |
+| 持久化 | 双后端：aiosqlite（默认，`data/agp.db` 单文件，零依赖）/ asyncpg（可选，pg-unified agp schema） | TASK-015 双后端；`DB_BACKEND` 切换，原 DECISION-002 |
 | 数值 | numpy（余弦/向量）+ pandas（长文本预处理策略4） | BRIEF 第六节 |
 | JWT | PyJWT（HS256，密钥 `.env`） | 模块 10 |
 | 前端 | 纯静态 SPA（原生 JS+CSS，`static/`） | DECISION-001，无构建步骤 |
@@ -47,7 +47,13 @@ FastAPI app（core/app.py）
 redis/milvus/neo4j 为存根适配器（接口一致，无真实服务时抛受控错误并在 `/api/memory/backend`
 报告 `stub=true`），文档说明部署期接入方式（DECISION-002 / PD-006）。
 
-## 3. 数据模型（SQLite，schema.sql）
+## 3. 数据模型（双后端；SQLite schema 固化于 `core/schema_sqlite.sql`）
+
+> 表结构双后端一致：sqlite 模式由 `core/schema_sqlite.sql` 幂等建表（20 表，全部
+> `IF NOT EXISTS`，D4）；postgres 模式由迁移脚本（阶段 C）建表，运行时不改表。
+> 方言差异集中在 `core/db.py`：sqlite 原生 `?`/`datetime('now')`/`INSERT OR IGNORE`；
+> postgres 经 `_to_pg()` 翻译为 `$N`/`to_char(...)`/`ON CONFLICT DO NOTHING`。
+> identity 表 INSERT 两端都返回自增 id（sqlite `lastrowid` / postgres `RETURNING id`）。
 
 | 表 | 关键字段 |
 |---|---|
@@ -190,9 +196,12 @@ redis/milvus/neo4j 为存根适配器（接口一致，无真实服务时抛受�
 ## 7. 部署
 - `run.sh`：建/复用 `.venv`（uv）→ 写 `.env`（若缺失，从 .env.example + 成员 env 取 key）
   → 清端口 → 起 uvicorn 8099 → 轮询 /healthz 200。
-- 无 Docker（VM 无 Docker，BRIEF 第三节）→ 原生 uvicorn 部署；原因记录于 DECISIONS.md
-  （DECISION-007）。单进程、SQLite 单文件、纯静态前端，离线可跑（LLM 走远程 vLLM，
-  embedding 本地降级）。
+- 双后端（TASK-015）：
+  - **默认 sqlite 零依赖**：`run.sh` 或 `docker compose up -d --build`（compose 挂卷
+    `./src/data:/app/data` 持久化 agp.db）即可跑，无需任何外部 DB/网络。
+  - **可选 postgres**：`.env` 设 `DB_BACKEND=postgres` + `AGP_DB_PASSWORD`；compose 叠加
+    `docker-compose.pg.yml` 接外部网络 `agp_default` 直连 pg-unified（agp schema）。
+  - 切换纯 .env 配置，业务代码零感知（D6 接口不变）。
 - 台账：端口 8099 登记 `~/hermes-workspace/shared/infrastructure/SERVER_REGISTRY.md`。
 
 ## 8. 已知问题 / 风险

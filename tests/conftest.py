@@ -42,35 +42,52 @@ def _load_env():
 def _reset_cache():
     """清 L1 语义缓存 + L0，保证'首跑必走 LLM'断言可重复（幂等前置）。
 
-    阶段 C 起数据在 PostgreSQL（pg-unified，agp schema）：走 asyncpg 直连清表。
+    按 DB_BACKEND 分派（TASK-015）：
+    - sqlite: 直接 aiosqlite 清 src/data/agp.db（默认路径）；
+    - postgres: 走 asyncpg 直连 pg-unified（agp schema）清表。
     连不上则跳过（不阻塞测试；缓存残留只影响"首跑走 LLM"类断言的稳定性）。
     """
     import asyncio
 
-    import asyncpg
-
     env = _load_env()
-    dsn = env.get("DB_DSN")
-    if not dsn:
-        user = env.get("DB_USER", "agp_user")
-        pwd = env.get("AGP_DB_PASSWORD", "")
-        host = env.get("DB_HOST", "pg-unified")
-        port = env.get("DB_PORT", "5432")
-        db = env.get("DB_NAME", "postgres")
-        dsn = f"postgresql://{user}:{pwd}@{host}:{port}/{db}"
+    backend = env.get("DB_BACKEND", "sqlite").lower()
 
     async def _do():
-        conn = await asyncpg.connect(dsn, server_settings={"search_path": "agp, public"})
-        try:
-            for t in ("memory_l1_cache", "memory_l1_image", "memory_l0_raw"):
-                await conn.execute(f"DELETE FROM {t}")
-        finally:
-            await conn.close()
+        if backend == "postgres":
+            import asyncpg
+            dsn = env.get("DB_DSN")
+            if not dsn:
+                user = env.get("DB_USER", "agp_user")
+                pwd = env.get("AGP_DB_PASSWORD", "")
+                host = env.get("DB_HOST", "pg-unified")
+                port = env.get("DB_PORT", "5432")
+                db = env.get("DB_NAME", "postgres")
+                dsn = f"postgresql://{user}:{pwd}@{host}:{port}/{db}"
+            conn = await asyncpg.connect(dsn, server_settings={"search_path": "agp, public"})
+            try:
+                for t in ("memory_l1_cache", "memory_l1_image", "memory_l0_raw"):
+                    await conn.execute(f"DELETE FROM {t}")
+            finally:
+                await conn.close()
+        else:
+            import aiosqlite
+            path = env.get("SQLITE_PATH", os.path.join(SRC, "data", "agp.db"))
+            if not os.path.isabs(path):
+                path = os.path.abspath(path)
+            if not os.path.exists(path):
+                return
+            conn = await aiosqlite.connect(path)
+            try:
+                for t in ("memory_l1_cache", "memory_l1_image", "memory_l0_raw"):
+                    await conn.execute(f"DELETE FROM {t}")
+                await conn.commit()
+            finally:
+                await conn.close()
 
     try:
         asyncio.run(_do())
     except Exception:
-        pass  # PG 不可达不阻塞测试
+        pass  # DB 不可达不阻塞测试
 
 
 @pytest.fixture(scope="session", autouse=True)

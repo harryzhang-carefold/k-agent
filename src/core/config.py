@@ -60,8 +60,13 @@ class Settings:
     STATIC_DIR = os.path.join(_SRC_DIR, "static")
     MAX_TOOL_ROUNDS = int(_get("MAX_TOOL_ROUNDS", "5"))
 
-    # 数据库：PostgreSQL 统一容器 pg-unified（阶段 C 迁移，替代 SQLite agp.db）
-    # 密码走 env（AGP_DB_PASSWORD，compose env_file 注入），严禁硬编码。
+    # 数据库后端（TASK-015 双后端：默认 sqlite 零依赖，postgres 可配置）
+    # DB_BACKEND: sqlite | postgres（默认 sqlite；纯 .env 切换，业务代码零感知）
+    DB_BACKEND = _get("DB_BACKEND", "sqlite").lower()
+    # SQLite 数据文件：默认 <src>/data/agp.db（容器内 compose 注入 /app/data/agp.db，卷持久化）
+    SQLITE_PATH = _get("SQLITE_PATH", os.path.join(_SRC_DIR, "data", "agp.db"))
+
+    # PostgreSQL（仅 DB_BACKEND=postgres 时需要；密码走 env，严禁硬编码，DECISION-004）
     DB_HOST = _get("DB_HOST", "pg-unified")
     DB_PORT = int(_get("DB_PORT", "5432"))
     DB_NAME = _get("DB_NAME", "postgres")
@@ -72,6 +77,19 @@ class Settings:
     DSN = _get(
         "DB_DSN",
         f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}")
+
+    @property
+    def effective_sqlite_path(self) -> str:
+        """sqlite 数据文件绝对路径（相对路径按进程 cwd 解析）。"""
+        p = self.SQLITE_PATH
+        return p if os.path.isabs(p) else os.path.abspath(p)
+
+    def require_dsn(self) -> str:
+        """postgres 模式 DSN 校验（D1: 仅 postgres 模式必需）。"""
+        if not self.DSN:
+            raise RuntimeError(
+                "DB_BACKEND=postgres 时必须配置 DSN（DB_DSN 或 DB_HOST/DB_USER/AGP_DB_PASSWORD 等）")
+        return self.DSN
 
 
 def _jwt_secret() -> str:

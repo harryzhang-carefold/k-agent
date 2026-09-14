@@ -383,3 +383,152 @@ LINKED_TO、小写、空串）被 400 拒绝时，src/dst 两个**孤儿节点�
 
 > 说明：本开发阶段不自行宣布「项目最终完成」。最终完成由测试（云天明）+ 验收（褚岩）决定。
 > 本文档已把服务部署方式、启动命令、真实自测证据、已知问题、测试提示全部写清，供进入测试。
+
+---
+
+# TASK-015 交付记录：AGP 数据库双后端（默认 SQLite 零依赖 + PostgreSQL 可配置）
+
+> 开发：章北海（2026-09-14，t_22a51d0c）。分支 `db-dual-backend`（feature，未 merge）。
+> 任务书：`shared/tasks/T-AGP-DB-DUAL.md`；决策 D1~D12 全部按任务书执行，未另行决策。
+
+## 目标回顾
+
+数据库层由「纯 asyncpg（阶段 C）」改为**双后端分派**：
+- **默认 SQLite**（`DB_BACKEND=sqlite`，零外部依赖，clone 即跑，首次启动自动建表 + 种子）
+- **PostgreSQL 可配置**（`DB_BACKEND=postgres`，现有 asyncpg 路径已验收、不重写）
+- 切换 = 纯 `.env` 配置，业务代码零感知（全部走 `core/db.py` 抽象层）
+
+## 改动清单（`02-development/`，git 可查）
+
+| 文件 | 改动 |
+|---|---|
+| `src/core/db.py` | 双后端分派。postgres 路径**逻辑逐字保留**（62 行代码逻辑验证未变，仅函数改名 `_pg_*` + 新增分派入口 `_backend()`/`connect()/init_db()/fetchall()/fetchone()/execute()/close()` 按 `S.DB_BACKEND` 路由）；新增 sqlite 路径 `_sqlite_*`（aiosqlite 单连接 + WAL + `check_same_thread`，`?`/`datetime('now')`/`INSERT OR IGNORE` 原生不走 `_to_pg`，identity 表 INSERT 用 `lastrowid`+`rowcount` 对齐 `RETURNING id` 语义）。新增 `backend_info()`（healthz 用） |
+| `src/core/config.py` | 加 `DB_BACKEND`（默认 sqlite）、`SQLITE_PATH`（默认 `<src>/data/agp.db`）、`effective_sqlite_path`（绝对路径解析）、`require_dsn()`（postgres 模式 DSN 校验） |
+| `src/core/schema_sqlite.sql` | **新增**。从 `agp.db` 的 `sqlite_master` 导出 20 表 + 全索引，全部补 `IF NOT EXISTS`，`executescript` 幂等 |
+| `src/requirements.txt` | 加 `aiosqlite`（保留 `asyncpg`） |
+| `src/core/app.py` | `healthz` 加 `db` 字段（`dbmod.backend_info()`，D8，不暴露密码） |
+| `src/memory/backend.py` | `LocalBackend.info()` 的 `store` 字符串按后端显示（SQLite 显示 path / PG 显示 schema+host） |
+| `tests/conftest.py` | `_reset_cache()` 按 `DB_BACKEND` 分派：sqlite 用 aiosqlite 清表 / postgres 用 asyncpg 清表（D7 范围 6） |
+| `src/.env.example` | 数据库段改为「默认 SQLite（零依赖）+ PG 可选」两组注释（D1） |
+| `docker-compose.yml` | sqlite 默认模式：加卷 `./src/data:/app/data`（持久化 agp.db）+ `SQLITE_PATH=/app/data/agp.db` + **去掉 external 网络声明**（零外部依赖）；镜像 tag `1.2.0-dual` |
+| `docker-compose.pg.yml` | **新增**。PG 模式叠加文件：只声明 external 网络 `agp_default`（`docker compose -f ... -f docker-compose.pg.yml up`） |
+| `DESIGN.md` / `README.md` | 技术栈/数据模型/数据库章节/部署章节同步（默认 sqlite、PG 可配置、切换方法） |
+| `02-development/.gitignore` | 已有 `src/data/`、`*.db`（agp.db 及备份均 gitignore，不入仓） |
+
+## 关键设计决策（对应任务书 D 编号）
+
+- **D2 asyncpg 路径一行不改**：验证脚本 `05-temp/verify_d2_pg_unchanged.py` 逐行比对 `main:src/core/db.py` 与现版本，**62 行代码逻辑全部逐字保留**（跳过 docstring/注释/签名/空行）。唯一允许的改动：函数改名（`connect`→`_pg_connect` 等）+ 新增 sqlite 路径与公共分派入口。`_pg_init` 内 `pool = await connect()` 保留原样（`connect()` 现是公共分派器，postgres 模式路由到 `_pg_connect`，行为等价）。
+- **D3 execute() 语义对齐**：sqlite `INSERT OR IGNORE` 冲突被忽略时 `lastrowid` 会**保留前一次 INSERT 的值（非 0）**，故用 `rowcount` 判断本条是否真插入——冲突时返回 `None`，与 asyncpg `ON CONFLICT DO NOTHING` 时 `fetchrow=None`→`None` 完全对齐（自测 A3 断言）。
+- **D4 schema 幂等**：`schema_sqlite.sql` 验证——空库导入 2 遍不报错；**有数据的库**（agp.db 字节副本）重复导入 2 遍不报错且 `users=4 / messages=706` 不变（`05-temp/gen_schema_sqlite.py` 验证）。
+- **D7 sqlite 连接**：aiosqlite 单连接 + WAL + `conn.row_factory=aiosqlite.Row`（业务 SQL 只写 `?`，FastAPI 多协程共享同一连接，WAL 允许读写并发）。
+- **D9 compose 双模式兼容**：sqlite 默认模式 base compose 无 external 网络（`docker compose config` 验证 `external: true` 计数=0；`agp_default` 仅是项目名 `agp` 自动生成的**内部**默认网络，compose 自建，非外部依赖）。PG 模式叠加 `docker-compose.pg.yml` 声明 external `agp_default`。
+- **生产 .env 自洽**：生产 `src/.env`（gitignore，不入仓）加 `DB_BACKEND=postgres`——线上行为与阶段 C **完全一致**，不依赖任何 05-temp 临时 override。新代码默认 sqlite 是「全新 clone 零依赖」的交付语义；线上既有部署显式声明 postgres。
+
+## 自测结果（真实运行，无 mock）
+
+### 1) sqlite 模式本地全链路（run.sh，无 Docker、无 PG 依赖）
+
+**证据：`05-temp/selftest_sqlite_final.log`**
+- `pytest tests/` → **64 passed in 58.11s**（真实 LLM / 真实 MCP stdio / 真实 WebSocket，无 PG 依赖，D7 范围 4 满足）
+- 核心接口冒烟全通：
+  - `admin` 登录 OK（roles=`super_admin`）
+  - `GET /api/agents` OK（6 个）
+  - `POST /api/agents`（建）OK（id=53）→ `DELETE /api/agents/53` OK
+  - RAG 检索 OK（top 3）
+  - 记忆查询 OK（L2 节点 47，P001 subgraph 6 节点）
+  - `POST /api/chat` 对话 OK（真实 vLLM，answer 非空，llm_calls=2）
+- `healthz` 的 `db` 字段：`{'backend': 'sqlite', 'path': '.../src/data/agp.db'}`（D8）
+- `memory_backend.store`：`SQLite(.../agp.db) + in-memory B+ tree/property graph`
+- 数据落盘验证：冒烟后 `conversations` 275→301、`messages` 706→782（真实写入 SQLite 文件）
+
+### 2) PG 模式容器冒烟（恢复 agp-app 容器，证明原 asyncpg 路径未破坏）
+
+**证据：`05-temp/selftest_pg2.log`**
+- 容器以 `DB_BACKEND=postgres` 运行，`healthz` 的 `db` 字段：`{'backend': 'postgres', 'host': 'pg-unified', 'port': 5432, 'database': 'postgres', 'schema': 'agp'}`
+- 核心接口冒烟全通：
+  - `admin` 登录 OK / `GET /api/agents` OK（6 个）
+  - 记忆 L2 节点 OK（**41 个**，含迁移数据，与线上锚点一致）
+  - P001 subgraph OK（6 节点 / 5 边）
+  - RAG 检索 OK（top 3）
+  - `POST /api/chat` 对话 OK（真实 LLM，llm_calls=2）
+- **`psql` 直连 pg-unified 核对**（证明容器真写 PG、非卷内 sqlite）：
+  `l2_nodes=41 / users=4 / messages=730 / agents=6`（l2_nodes=41 命中迁移锚点）
+
+### 3) schema 幂等验证
+
+**证据：`05-temp/gen_schema_sqlite.py` 运行输出**
+- 空库导入 2 遍：均 OK（幂等）
+- 业务 SQL 冒烟：`INSERT`（identity 返回 lastrowid）/ `INSERT OR IGNORE`（原生）/ `SELECT ?` / `datetime('now')` 默认值 / `ON CONFLICT ... DO UPDATE` upsert（l2_merge_edge 同款 SQL）全 OK
+- 有数据库（agp.db 字节副本）重复导入 2 遍：均 OK，`users=4 / messages=706` 不变（D4 要求）
+
+### 4) D2 asyncpg 路径零改动验证
+
+**证据：`05-temp/verify_d2_pg_unchanged.py` 运行输出**
+- `main:src/core/db.py` 的 62 行代码逻辑全部逐字保留（缺失 0 行）
+
+### 5) 8081 网关 /agent/ 路由回归（红线：网关不动）
+
+**实测**：
+- `GET /agent/healthz` → HTTP 200
+- `GET /agent/` → HTTP 200
+- 网关经 `/agent/` 透传 healthz：`status=ok / db.backend=postgres`（网关未动，路由不受影响）
+
+### 6) 部署环境状态（服务已恢复运行）
+
+- **线上 agp-app**：镜像 `agp-platform:1.2.0-dual`（最终代码重建），`DB_BACKEND=postgres`（生产 .env），`0.0.0.0:8099`，healthcheck healthy，`healthz` 200。
+- **实测资源回写台账**（SERVER_REGISTRY.md）：agp-app 47.2MiB（/512MiB）、pg-unified 45MiB、gw-nginx 15.3MiB。
+- **数据兜底**：`src/data/agp.db.bak-20260914`（20 表迁移基线，users=4/messages=706/l2_nodes=41）gitignore 本地保留；`agp.db` 现文件自测后已恢复为干净基线（sqlite 模式默认路径，重启自动建表幂等）。
+- **未触碰红线**：未动 8081 网关、未动 pg-unified 容器及其 agp schema 迁移数据、未动哮喘系统。自测临时停 agp-app（sqlite 本地测试需释放 8099）后已恢复 PG 模式 online。
+
+## 部署（可运行）
+
+```bash
+cd 02-development
+
+# --- 默认 SQLite（零依赖，clone 即跑）---
+cp src/.env.example src/.env        # 只需填 AI_MODEL_API_KEY / JWT_SECRET / SEED_PASSWORD
+docker compose up -d --build         # 无需任何外部网络/PG
+curl http://localhost:8099/healthz   # db.backend=sqlite
+
+# 或本地原生：./run.sh
+
+# --- 可选 PostgreSQL（.env 设 DB_BACKEND=postgres + AGP_DB_PASSWORD）---
+sg docker -c 'docker network inspect agp_default >/dev/null 2>&1 || docker network create agp_default'
+docker compose -f docker-compose.yml -f docker-compose.pg.yml up -d --build
+```
+
+## 已知问题 / 说明
+
+1. **生产 .env 含 `DB_BACKEND=postgres`**（gitignore 不入仓）：这是为了让线上既有部署行为与阶段 C 完全一致、不依赖临时 override。全新 clone 用 `.env.example`（默认 sqlite 零依赖）即可，两者不冲突——交付语义 = 默认 sqlite，线上既有 = 显式 postgres。测试做「默认模式 AC-1（全新 clone）」时请用 `.env.example` 生成的 .env（无 DB_BACKEND 或 =sqlite）。
+2. **sqlite 单连接 + WAL**：面向 AGP 单进程低并发（对话/RAG/记忆），WAL 允许读写并发，满足当前场景。若未来需要高并发写，可升级为 aiosqlite 连接池（接口不变，仅 `_sqlite_connect` 内部改动）。
+3. **`SQLITE_PATH` 相对路径**：按进程 cwd 解析。本地 run.sh（cwd=src）→ `src/data/agp.db`；compose 显式设 `/app/data/agp.db`。`effective_sqlite_path` 已做绝对化。
+4. **compose base 的 `agp_default`**：是项目名 `agp` 自动生成的内部网络（非 external），全新 clone 时 compose 自建，零外部依赖成立（`external: true` 计数=0 已验证）。
+
+## 自测证据索引（均在 `05-temp/`）
+
+| 文件 | 内容 |
+|---|---|
+| `gen_schema_sqlite.py` | schema 导出 + 幂等/业务 SQL 冒烟/有数据库重复导入验证脚本 |
+| `selftest_db_dual.py` | db 层双后端单元冒烟（sqlite 11 项：identity INSERT/OR IGNORE 语义/fetchall/fetchone/upsert/backend_info/分派路由/未知后端 fail-fast） |
+| `selftest_sqlite.sh` / `selftest_sqlite_final.log` | sqlite 模式全链路（run.sh + pytest 64 + 核心接口冒烟 + 落盘验证） |
+| `selftest_pg.sh` / `selftest_pg2.log` | PG 模式容器冒烟（healthz postgres + 接口 + psql 核对 l2_nodes=41）+ 收尾清理 |
+| `verify_d2_pg_unchanged.py` | D2 合规：asyncpg 路径 62 行代码逻辑逐字未变 |
+| `healthz_sqlite_final.json` / `healthz_pg2.json` / `healthz_final.json` | 双模式 + 线上恢复的 healthz 原始 JSON |
+| `run_sh_sqlite*.log` / `pg_up*.log` / `pg_rebuild_final.log` | run.sh 与 compose 启动原始日志 |
+
+## 给测试（云天明 t_12b63ade）的提示
+
+- **默认 sqlite 模式（AC-1）**：建议用**全新 clone/复制到 05-temp**（不带 PG 容器/网络），`.env` 用 `.env.example` 生成（无 DB_BACKEND 或 =sqlite），`docker compose up -d --build`（或 run.sh）→ healthz `db.backend=sqlite` → admin 登录 → 建 agent/对话/RAG → 数据落 `src/data/agp.db`，重启后仍在。
+- **PG 模式（AC-2）**：`.env` 设 `DB_BACKEND=postgres` + `AGP_DB_PASSWORD`，叠加 `docker-compose.pg.yml`，行为应与当前线上完全一致（记忆 41 节点）。
+- **切换一致性（AC-3）**：同一 .env 只改 `DB_BACKEND`，对比两套后端核心接口（登录/CRUD/对话/WS/RAG/记忆查询）。
+- **测试套件（AC-4）**：双模式 `pytest tests/` 全绿（sqlite 模式无 PG 依赖必须能跑——本开发已验证 64 passed）。
+- **回归（AC-6）**：8081 网关 `/agent/` 路由未动（本开发已验证 200）。
+- **注意**：`src/data/agp.db.bak-20260914` 是开发已备份的回滚兜底，测试做 sqlite 全新目录测试时**不要动仓库内该备份文件**（用 05-temp 独立副本）。
+
+## 状态
+
+- 开发：**DONE**（双后端实现 + schema 固化 + 部署环境双模式可运行 + 自测双绿 + D2 合规 + 网关回归 PASS）。
+- 是否可进入测试：**是**（线上 agp-app 以 PG 模式 online；sqlite 模式本地 run.sh 可复现；测试可按上提示独立验证）。
+- 交下游：t_12b63ade（云天明，双模式回归测试）。
+
+> 说明：本任务只做开发 + 自测证据，**不做最终验收**（终审由褚岩做，双模式各起一次真实容器验证，不采信自测）。

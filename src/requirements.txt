@@ -2,6 +2,7 @@ fastapi
 uvicorn
 httpx
 pydantic
+aiosqlite
 asyncpg
 pandas
 numpy

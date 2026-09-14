@@ -1,6 +1,6 @@
 # AI Agent Platform (k-agent)
 
-多模型 AI Agent 平台：OpenAI 兼容 LLM 底座 + 工具调用引擎 + 三层记忆 + RAG 知识库 + MCP 插件体系，REST/WS API 与纯原生 JS 单页前端，Docker Compose 部署，数据层 PostgreSQL。
+多模型 AI Agent 平台：OpenAI 兼容 LLM 底座 + 工具调用引擎 + 三层记忆 + RAG 知识库 + MCP 插件体系，REST/WS API 与纯原生 JS 单页前端，Docker Compose 部署，数据层双后端（默认 SQLite 零依赖，PostgreSQL 可配置）。
 
 ## 1. 功能特性
 
@@ -40,14 +40,15 @@
                 │  mcp/  stdio JSON-RPC 客户端 + plugins 注册表  │
                 │  services/longtext.py  长文本 4 策略           │
                 ├──────────────────────────────────────────────┤
-                │  core/db.py  asyncpg 连接池                    │
+                │  core/db.py  双后端：aiosqlite(默认) | asyncpg │
                 │  core/security.py  JWT + RBAC                 │
                 └──────────────────┬───────────────────────────┘
-                                   │ search_path=agp
-                        ┌──────────▼──────────┐
-                        │ PostgreSQL (pg-unified) │
-                        │ schema: agp             │
-                        └───────────────────────┘
+                      DB_BACKEND=  │  DB_BACKEND=postgres
+                      sqlite       │
+                ┌──────────────────▼──────────┐
+                │ SQLite src/data/agp.db       │  默认（零依赖）
+                │ 或 PostgreSQL (pg-unified)   │  可选（agp schema）
+                └─────────────────────────────┘
 ```
 
 代码目录：
@@ -118,8 +119,21 @@ tests/           pytest 套件（auth/agents/chat/rag/memory/mcp/longtext/ws）
 | `JWT_TTL_HOURS` | `24` | token 有效期 |
 | `SEED_PASSWORD` | `admin123` | 4 个种子用户初始密码（admin/developer/user/viewer），生产必改 |
 
-### 3.6 数据库（PostgreSQL，schema 隔离）
+### 3.6 数据库（双后端：默认 SQLite，PostgreSQL 可配置）
 
+由 `DB_BACKEND` 切换（`sqlite` | `postgres`），业务代码零感知（全部走 `core/db.py` 抽象层）。
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `DB_BACKEND` | `sqlite` | 后端选择：`sqlite`（零依赖）或 `postgres` |
+| `SQLITE_PATH` | `<src>/data/agp.db` | 仅 sqlite 模式；数据文件路径（相对按进程 cwd 解析）。compose 内固定为 `/app/data/agp.db` |
+
+**SQLite（默认，零外部依赖，clone 即跑）**
+- 首次启动 `init_db()` 自动 `executescript(src/core/schema_sqlite.sql)` 幂等建表（20 表，全部带 `IF NOT EXISTS`）+ 种子数据，无需任何外部服务。
+- 方言原生支持：`?` 占位符、`datetime('now')`、`INSERT OR IGNORE`（不走 `_to_pg` 翻译）。
+- 数据落 `src/data/agp.db`（compose 挂卷 `./src/data:/app/data` 持久化，重启不丢）。
+
+**PostgreSQL（可选，`DB_BACKEND=postgres`）**
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `DB_HOST` | `pg-unified`（compose 服务名） | 本地调试改 `127.0.0.1` |
@@ -130,7 +144,12 @@ tests/           pytest 套件（auth/agents/chat/rag/memory/mcp/longtext/ws）
 | `DB_SCHEMA` | `agp` | 连接池 init 自动 `SET search_path=agp,public` |
 | `DB_DSN` | 由上述拼装 | 也可直接给完整 `postgresql://...` DSN 覆盖 |
 
-历史：系统曾基于 SQLite（`src/data/agp.db`），2026-09 迁移至 PostgreSQL 统一容器，方言翻译集中在 `core/db.py::_to_pg()`（业务 SQL 仍写 `?` 占位符）。
+- 现有 asyncpg 连接池路径完全保留（已验收，未重写）。表由迁移脚本创建，运行时不建/改表。
+- 方言翻译集中在 `core/db.py::_to_pg()`：`?`→`$N`、`datetime('now')`→`to_char(...)`、`INSERT OR IGNORE`→`ON CONFLICT DO NOTHING`、identity 表 INSERT 自动 `RETURNING id`。
+
+**切换方法**：只改 `.env` 的 `DB_BACKEND`（sqlite ↔ postgres），重启即生效，业务代码零改动。
+
+历史：系统早期基于 SQLite，2026-09 统一迁移至 PostgreSQL（阶段 C），2026-09 又改回**默认 SQLite + PG 可配置**（TASK-015 双后端，兼顾零依赖易部署与既有 PG 生产数据）。
 
 ### 3.7 服务
 
@@ -143,39 +162,46 @@ tests/           pytest 套件（auth/agents/chat/rag/memory/mcp/longtext/ws）
 
 | 项 | 值 |
 |---|---|
-| 镜像 | `agp-platform:1.1.0-pg`（build: `./src/Dockerfile`, python:3.12-slim） |
+| 镜像 | `agp-platform:1.2.0-dual`（build: `./src/Dockerfile`, python:3.12-slim） |
 | 容器名 | `agp-app`，`restart: unless-stopped` |
 | 端口 | `8099:8099` |
-| 网络 | 外部网络 `agp_default`（用于直连 pg-unified） |
+| 卷 | `./src/data:/app/data`（持久化 `agp.db`，sqlite 模式重启不丢数据） |
+| 网络 | 默认（sqlite）不需要外部网络；PG 模式叠加 `docker-compose.pg.yml` 接外部网络 `agp_default`（直连 pg-unified） |
 | 资源 | `mem_limit: 512m`，`cpus: 1.0` |
 | healthcheck | 每 15s 探 `/healthz`（start_period 20s） |
 
 ## 4. 部署与启动
 
-前置：一个可达的 OpenAI 兼容 LLM 端点 + 一个 PostgreSQL（独立 `pg-unified` 容器，需已建 `agp` schema 与 `agp_user` 用户；参考 postgres-unified 项目的 docker-compose）。
+前置：一个可达的 OpenAI 兼容 LLM 端点。**默认 SQLite 模式无需任何数据库外部依赖**；仅 PG 模式需要一个 PostgreSQL（独立 `pg-unified` 容器，需已建 `agp` schema 与 `agp_user` 用户；参考 postgres-unified 项目的 docker-compose）。
 
-### 方式 A：Docker Compose（推荐）
+### 方式 A：Docker Compose（推荐，默认 SQLite 零依赖）
 
 ```bash
 cd 02-development
 
-# 1. 配置密钥
+# 1. 配置密钥（只需 LLM key + JWT，无需数据库密码）
 cp src/.env.example src/.env
-#    填写 AI_MODEL_API_KEY / JWT_SECRET(>=32字节) / AGP_DB_PASSWORD / SEED_PASSWORD
+#    填写 AI_MODEL_API_KEY / JWT_SECRET(>=32字节) / SEED_PASSWORD
 
-# 2. 确保外部网络存在（首次）
-sg docker -c 'docker network inspect agp_default >/dev/null 2>&1 || docker network create agp_default'
-#    （若 pg-unified 未建，先拉起: cd ../postgres-unified && docker compose up -d）
-
-# 3. 构建并启动
+# 2. 构建并启动（sqlite 模式无需任何外部网络）
 docker compose up -d --build
 
-# 4. 验证
-curl http://localhost:8099/healthz      # 应返回 status:up 及组件状态
+# 3. 验证
+curl http://localhost:8099/healthz      # db.backend=sqlite
 open  http://localhost:8099/            # 前端 SPA，admin / <SEED_PASSWORD> 登录
 ```
 
-常用运维：`docker compose logs -f`、`docker compose ps`、`docker compose down`（保留 PG 数据）。
+**切换为 PostgreSQL 模式**：
+```bash
+# 1. .env 改为 DB_BACKEND=postgres 并填 AGP_DB_PASSWORD（来源 postgres-unified 项目 .env）
+# 2. 确保外部网络存在（首次）
+sg docker -c 'docker network inspect agp_default >/dev/null 2>&1 || docker network create agp_default'
+#    （若 pg-unified 未建，先拉起: cd ../postgres-unified && docker compose up -d）
+# 3. 叠加 PG 网络配置启动
+docker compose -f docker-compose.yml -f docker-compose.pg.yml up -d --build
+```
+
+常用运维：`docker compose logs -f`、`docker compose ps`、`docker compose down`（保留卷数据）。
 
 ### 方式 B：原生进程（本地开发）
 
@@ -185,17 +211,17 @@ cd 02-development
 ./run.sh --check    # 只读健康检查
 ```
 
-本地直连宿主 PG 时 `.env` 设 `DB_HOST=127.0.0.1`。
+默认 sqlite 模式零依赖，`run.sh` 直接可跑；PG 模式 `.env` 设 `DB_BACKEND=postgres` + `DB_HOST=127.0.0.1`（宿主 PG）。
 
 ### 种子数据
 
-首次连接 PG 的 `agp` schema 为空时，`seed.py` 幂等写入：4 用户 / 4 角色 / 13 权限 / 医疗演示 agent / skills / demo MCP server / plugins / RAG 知识库 / L2 立体图。已存在则跳过。
+首次启动（库为空）时，`seed.py` 幂等写入：4 用户 / 4 角色 / 13 权限 / 医疗演示 agent / skills / demo MCP server / plugins / RAG 知识库 / L2 立体图。已存在则跳过。sqlite 模式 `init_db()` 先自动建表（`schema_sqlite.sql`），PG 模式表由迁移脚本预先创建。
 
 ### 测试
 
 ```bash
 cd 02-development
-.venv/bin/python -m pytest tests/ -v     # 全量（依赖运行中的服务 + PG）
+.venv/bin/python -m pytest tests/ -v     # 全量（依赖运行中的服务；sqlite 模式无 PG 依赖）
 ```
 
 ## 5. API 速览
