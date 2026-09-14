@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Agent Platform</title>
+<link rel="stylesheet" href="static/style.css">
+</head>
+<body>
+<div id="app">
+  <!-- 登录视图 -->
+  <div id="login-view" class="view login-wrap">
+    <div class="login-card">
+      <h1>AI Agent Platform</h1>
+      <p class="sub">dev-team 构建 · 可定制 AI Agent 平台</p>
+      <input id="login-user" placeholder="用户名（admin / developer / user / viewer）" autocomplete="username">
+      <input id="login-pass" type="password" placeholder="密码" autocomplete="current-password">
+      <button id="login-btn" class="primary">登录</button>
+      <div id="login-err" class="err"></div>
+      <p class="hint">seed 密码见 .env（SEED_PASSWORD）</p>
+    </div>
+  </div>
+
+  <!-- 主视图 -->
+  <div id="main-view" class="view hidden">
+    <aside class="sidebar">
+      <div class="brand">AI Agent<br>Platform</div>
+      <nav id="nav">
+        <a data-page="dashboard" data-perms="">Dashboard</a>
+        <a data-page="agents" data-perms="">Agent 构建器</a>
+        <a data-page="chat" data-perms="">对话</a>
+        <a data-page="rag" data-perms="">RAG 管理</a>
+        <a data-page="users" data-perms="">用户权限</a>
+        <a data-page="memory" data-perms="">记忆</a>
+        <a data-page="ext" data-perms="">MCP-Skills</a>
+      </nav>
+      <div class="side-foot">
+        <div id="whoami"></div>
+        <button id="logout-btn">退出</button>
+      </div>
+    </aside>
+    <main class="content">
+      <div id="page-dashboard" class="page hidden"></div>
+      <div id="page-agents" class="page hidden"></div>
+      <div id="page-chat" class="page hidden"></div>
+      <div id="page-rag" class="page hidden"></div>
+      <div id="page-users" class="page hidden"></div>
+      <div id="page-memory" class="page hidden"></div>
+      <div id="page-ext" class="page hidden"></div>
+      <footer class="footer">AI Agent Platform · dev-team 构建</footer>
+    </main>
+  </div>
+</div>
+<script src="static/app.js"></script>
+</body>
+</html>

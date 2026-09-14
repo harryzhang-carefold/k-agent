@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+httpx
+pydantic
+asyncpg
+pandas
+numpy
+PyJWT
+python-multipart
+websockets
+websocket-client
+pytest

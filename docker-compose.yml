@@ -1,0 +1,46 @@
+# AI Agent Platform — Docker Compose 部署
+# 原生进程 (uvicorn on 8099) 的容器化替代。
+# 用法:
+#   docker compose up -d --build
+#   docker compose logs -f
+#   docker compose down
+#
+# 数据层：PostgreSQL 统一容器 pg-unified（阶段 C 迁移，替代 SQLite agp.db）。
+# - agp 容器在 agp_default 网络上直连 pg-unified:5432（pg 容器挂双网络）。
+# - 全部密钥（含 AGP_DB_PASSWORD）从 ./src/.env 注入（env_file，运行时注入、
+#   不进镜像——.dockerignore 排除 .env；DECISION-004）。
+# - 连接参数默认值在 src/core/config.py（DB_HOST=pg-unified / DB_USER=agp_user /
+#   DB_NAME=postgres / DB_PORT=5432 / DB_SCHEMA=agp），本地调试可经 .env 覆盖
+#   DB_HOST=127.0.0.1。
+
+name: agp
+
+services:
+  app:
+    build:
+      context: ./src
+      dockerfile: Dockerfile
+    image: agp-platform:1.1.0-pg
+    container_name: agp-app
+    restart: unless-stopped
+    env_file:
+      - ./src/.env
+    environment:
+      TZ: Asia/Shanghai
+    ports:
+      - "8099:8099"
+    networks:
+      - agp_default
+    mem_limit: 512m
+    cpus: "1.0"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request;urllib.request.urlopen('http://localhost:8099/healthz', timeout=4)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+networks:
+  agp_default:
+    external: true

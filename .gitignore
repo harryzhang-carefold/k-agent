@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# 敏感/本地配置（绝不上库）
+.env
+.env.*
+!.env.example
+*.local
+
+# 运行期数据 / 回滚兜底
+src/data/
+data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+nohup.out
+*.log
+
+# 操作系统 / 编辑器
+.DS_Store
+.idea/
+.vscode/
+*.swp

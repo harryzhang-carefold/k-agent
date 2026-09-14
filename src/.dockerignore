@@ -1,0 +1,11 @@
+# 构建上下文排除项（02-development/src 为 build context）
+.venv/
+__pycache__/
+*.pyc
+.env
+data/
+.pytest_cache/
+tests/
+*.db
+nohup.out
+.DS_Store
