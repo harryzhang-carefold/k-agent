@@ -704,3 +704,96 @@ interpreted as an integer)`。sqlite 模式正常（200/400）。
 | `mock_openai.py` | OpenAI 兼容 mock server（/v1/models + /v1/embeddings，供 /config/test 真实连通） |
 | `check_pg_perms.sh` | agp schema owner/CREATE 权前置验证（agp_user=owner，has CREATE=t） |
 | `test_config_db_*.db` | pytest sqlite 测试库（每进程一份，跑完自清理） |
+
+---
+
+# TASK-022 交付记录：F1 后端 — skills 上传导入 + MCP PUT/DELETE 补全 + skills.updated_at + mcp env 持久化
+
+> 分支：`feat/ui-tools`（续 TASK-021，commit 见 git log）。本卡只做 F1 后端；F3 已完成（TASK-021），前端归 TASK-023。
+
+## 1. 接口变更摘要
+
+### 1.1 新增 `POST /api/ext/skills/upload`（multipart）
+- 字段名 `files`（可多值）。支持：
+  - 单文件 `.md` / `.txt`
+  - zip 目录（内含多个 SKILL.md / *.md / *.txt；忽略非 md/txt、`__MACOSX`、隐藏文件）
+- **SKILL.md 风格解析**：头部 frontmatter（`---` 包围，YAML 风格 `key: value`）取 `name` / `description`；
+  无 frontmatter 或无 name 时，用文件名命名（去扩展名，`_`/空格→`-`，小写，去危险字符）。
+  正文 = frontmatter 之外的内容（strip 后入库）。
+- **批量入库 + 重名 409 语义**：重名（库内已有 / 本批次内重复）→ 跳过并回报，整批 200（不 400/409 崩溃）。
+- 返回：
+  ```json
+  {"created": [{"name","id","source"}], "skipped": [{"name","reason"}],
+   "failed": [{"file","reason"}], "counts": {"created","skipped","failed"}}
+  ```
+- 约束：单文件/zip ≤ 10MB；单次 ≤ 50 文件；非法 zip → 400；无 md/txt 的 zip → 记入 failed。
+- 权限：`ext:manage`（与现有 skills CRUD 一致，RBAC 矩阵不动）。
+
+### 1.2 MCP CRUD 补全
+- `PUT /api/ext/mcp/{mid}`：更新 name/command/args/env/enabled（改名冲突 409，不存在 404）。
+- `DELETE /api/ext/mcp/{mid}`：删除；**有 agent_bindings 引用时 409**（message 列出引用方 agent 名，提示先解绑）；不存在 404。
+- `POST /api/ext/mcp`：**env 写入**（此前 `MCPServerIn` 有 env 字段但 INSERT 丢失）；新增 `enabled` 字段（默认 true）。
+- `GET /api/ext/mcp`：返回值中 `args`/`env` 反序列化为 JSON，`enabled` 归一为 bool（此前回传原始 JSON 文本）。
+- **env 生效路径**：`/mcp/{mid}/tools`、`/mcp/{mid}/tools/{tool}/call` 及 agent 对话的 `mcp_call` 插件路由
+  均按持久化的 env 注入 MCP 子进程（`mcp_client.with_session(..., env=...)`）。
+
+### 1.3 skills.updated_at + mcp_servers.env（双后端列）
+- `skills.updated_at`（TEXT，默认 now）：新建默认 now，PUT 刷新（`datetime('now')` / PG `to_char(now()...)`）。
+- `mcp_servers.env`：MCP 环境变量。双后端统一存 **JSON 文本**（sqlite TEXT / PG JSONB），
+  API 层统一反序列化为 dict（`mcp_client.env_of_row`），双后端行为一致。
+
+## 2. 双后端 schema 改动（identity/建表清单同步 db.py 双分派）
+
+| 后端 | 改动 |
+|---|---|
+| SQLite | `schema_sqlite.sql` skills 表 CREATE 含 `updated_at`（21 表幂等）；`db._sqlite_init` 对旧库在线 `ALTER TABLE ADD COLUMN`（skills.updated_at + mcp_servers.env，duplicate column 幂等忽略） |
+| PG | `db._pg_init` 幂等 `ALTER TABLE ADD COLUMN IF NOT EXISTS`：skills.updated_at TEXT（默认 `to_char(now()...)`）+ mcp_servers.env JSONB（默认 `'{}'::jsonb`）；建列失败仅告警降级，不阻断启动 |
+
+> 说明：`mcp_servers.env` 在 sqlite 存 TEXT、PG 存 JSONB，但 API 层 `env_of_row` 统一处理（bytes/str 走 json.loads，dict 直接返回），
+> 对上层完全透明，双后端读回一致（已双绿验证）。
+
+## 3. 自测结果
+
+### 3.1 pytest（本地 venv，sqlite 模式，自包含 TestClient）
+- **新增 `tests/test_t022_ext_tools.py` 24 用例全绿**，覆盖：
+  - upload 单文件：frontmatter 解析 / 无 frontmatter 文件名命名 / .txt / 空内容跳过 / 非法类型 failed
+  - upload zip：多 SKILL.md 批量入库 / 坏 zip 400 / 无 md 的 zip 记 failed / 无文件 400
+  - 重名 409 语义：库内重名跳过回报 + 原内容不被覆盖 / 批次内重名 / 混合批次归类
+  - skills.updated_at：新建有值 / PUT 跨秒刷新（直读 DB 断言）/ 改名校验 409
+  - mcp：create 带 env 持久化回显（直读 DB）/ PUT 全字段 / PUT 404+改名 409 / DELETE ok+404 / DELETE 引用 409+解绑后可删 / env 默认空
+  - RBAC：upload/mcp put/delete 无 token 401 / viewer 403 / admin 通过
+  - 双后端 DDL 等价：sqlite schema 幂等 + 旧库 ALTER 幂两遍 / PG 列补齐 DDL 结构断言 / env_of_row 双形态归一
+- **全量回归**：`pytest tests/` → **100 passed, 5 failed**。5 个失败为**存量环境问题**（打线上 8099 旧镜像容器，`llm_calls==0`，
+  已在 TASK-021 用 main 基线 aad7179 复现确认为线上 agp-app LLM 运行态问题，与本卡无关）：
+  test_agents_chat_rag.py 4 例 + test_memory_mcp_longtext_ws.py::test_ws_streaming_and_cache_hit。
+
+### 3.2 PG 模式（docker run 隔离容器 t022-pg :8598，DECISION-010 合规，禁用项目 compose）
+- **12/12 PASS**（`05-temp/t022/pg_selftest.sh` / `pg_selftest_output.log`）：
+  - agp schema `skills.updated_at` + `mcp_servers.env` 列真实 ALTER 补齐（information_schema 核对）
+  - upload 单文件（frontmatter 解析 + updated_at）/ 重名跳过回报
+  - mcp create 带 env（jsonb 落库 + 读回 + psql 直查键序无关比对）/ PUT 全字段 + 读回 / DELETE 404 / 引用 409 / 正常删除
+- 自测结束已清空 agp schema 测试行（skills/mcp_servers/agents/agent_bindings，不留生产库测试数据）。
+
+## 4. 部署说明（本卡不重建镜像/不重启线上 agp-app）
+- 代码在 `feat/ui-tools` 分支；**线上 agp-app 仍为 `agp-platform:1.2.0-dual` 旧镜像**（无 upload/PUT/DELETE 端点、无 env 列），
+  镜像重建 + compose up 归 TASK-025（褚岩终审卡，任务书硬性约束 7）。
+- 旧镜像兼容：新列（skills.updated_at / mcp_servers.env）由**新代码启动时幂等 ALTER** 补齐；
+  旧镜像不写/不读这两列，重建前后均无风险。PG 侧 agp_user 为 schema owner 有 ALTER 权（已实测）。
+- 台账（SERVER_REGISTRY.md）已登记：agp schema 新增 2 列（skills.updated_at + mcp_servers.env）+ 在线 ALTER 机制 + TASK-022 更新记录行。
+- 端口/网关/RBAC 零变更（8099/8081//agent/ 不动，13 权限×4 角色矩阵不动，plugins 保持内置只读）。
+
+## 5. 已知问题
+1. **存量 5 个 chat/WS 集成用例失败**（llm_calls==0，打线上 8099 旧镜像容器）：本卡已确认与 TASK-021 同一根因
+   （线上 agp-app LLM 运行态问题，main 基线同样失败），非本卡引入。TASK-024 增量测试前需先排查线上 agp-app LLM 运行态（重启容器或查日志），否则回归基线不干净。
+2. 线上 agp-app 未重建镜像前，upload/PUT/DELETE 端点与 env 持久化在生产容器内不可用（分支代码已就绪，等 TASK-025 重建）。
+3. **测试基建提示（供 TASK-024 参考）**：`test_t022_ext_tools.py` 与 `test_system_config.py` 同为进程内自包含测试（TestClient 起独立 app 实例），
+   fixture 内已就地强制 `DB_BACKEND=sqlite` 与 S 基准值，与全量套件导入顺序无关；新增进程内测试勿依赖 monkeypatch.setenv 影响已建模块的 S。
+4. skills.upload 重名采用"跳过并回报"而非"覆盖"——如需覆盖语义由前端在上传前删除旧 skill（当前 UI 无此交互，归 TASK-023）。
+
+## 6. 自测证据索引（05-temp/t022/）
+| 文件 | 内容 |
+|---|---|
+| `pg_selftest.sh` / `pg_selftest_output.log` | PG 模式隔离容器自测脚本 + 12/12 全绿输出 |
+| `fullsuite.log` | pytest 全量回归（100 passed, 5 存量失败）输出 |
+| `smoke.db` | 手工功能冒烟 sqlite 库（upload/mcp 全路径，跑完保留备查） |
+| `probe_env.sh` | PG mcp_servers.env 列存储探针（jsonb 键序确认） |

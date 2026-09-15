@@ -17,6 +17,21 @@ def set_demo_script(path: str):
     _DEMO_SCRIPT = path
 
 
+def env_of_row(row: dict) -> dict:
+    """DB 行的 env 列 -> dict（TASK-022 / F1）。
+
+    双后端兼容：sqlite 存 JSON 文本 / PG 存 JSONB（asyncpg 已反序列化为 dict）/
+    旧行 NULL 均归一为 dict；JSON 文本损坏 -> {}（不抛错）。
+    """
+    env = row.get("env")
+    if isinstance(env, (bytes, str)):
+        try:
+            return json.loads(env or "{}")
+        except json.JSONDecodeError:
+            return {}
+    return env if isinstance(env, dict) else {}
+
+
 class MCPSession:
     def __init__(self, command: str, args: list[str], env: dict | None = None,
                  timeout: float = 10.0):

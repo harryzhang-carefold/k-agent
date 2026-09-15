@@ -146,7 +146,8 @@ CREATE TABLE IF NOT EXISTS skills (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT UNIQUE NOT NULL,
   description TEXT,
-  content TEXT NOT NULL
+  content TEXT NOT NULL,
+  updated_at TEXT DEFAULT (datetime('now'))   -- TASK-022 / F1: 最近修改时间（新建默认 now，PUT 刷新）
 );
 
 CREATE TABLE IF NOT EXISTS user_roles (

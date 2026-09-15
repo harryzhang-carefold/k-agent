@@ -20,6 +20,7 @@ from llm import provider as llm
 from rag import rag
 from memory import backend as memory
 from mcp import plugins as plugin_registry
+from mcp.mcp_client import env_of_row as _mcp_env_of
 from engine import cache_router
 
 TOOL_PROTOCOL = (
@@ -218,7 +219,7 @@ class AgentEngine:
             if mcp_row:
                 ctx = {"mcp_command": mcp_row["command"],
                        "mcp_args": json.loads(mcp_row["args"] or "[]"),
-                       "mcp_env": {}}
+                       "mcp_env": _mcp_env_of(mcp_row)}
             res = await plugin_registry.call_plugin(name, tc.get("arguments") or {}, ctx)
             if on_token:
                 await on_token(f"[tool_call:{name}] ")
@@ -281,7 +282,7 @@ class AgentEngine:
                 tc.get("name"), tc.get("arguments") or {},
                 {"mcp_command": mcp_row["command"] if mcp_row else None,
                  "mcp_args": json.loads(mcp_row["args"] or "[]") if mcp_row else [],
-                 "mcp_env": {}})
+                 "mcp_env": _mcp_env_of(mcp_row) if mcp_row else {}})
             messages.append({"role": "assistant", "content": out["answer"]})
             messages.append({"role": "user",
                              "content": f"[tool] {tc.get('name')} 执行结果: {json.dumps(res, ensure_ascii=False)}\n请基于以上工具结果回答用户原始问题。"})

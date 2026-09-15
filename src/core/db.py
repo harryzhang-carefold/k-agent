@@ -92,6 +92,19 @@ async def _pg_init():
             import logging
             logging.getLogger("core.db").warning(
                 "settings 表创建失败（降级为纯内存配置，重启不持久）: %s", e)
+        # TASK-022 / F1: skills.updated_at + mcp_servers.env 列幂等补齐（旧库无列时
+        # 在线加列；IF NOT EXISTS 可重复执行）。失败仅告警——旧列缺失只影响
+        # updated_at 回显 / mcp env 持久化，不阻断启动。
+        for ddl in (
+            "ALTER TABLE skills ADD COLUMN IF NOT EXISTS updated_at TEXT"
+            " DEFAULT (to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS'))",
+            "ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS env JSONB DEFAULT '{}'::jsonb",
+        ):
+            try:
+                await c.execute(ddl)
+            except Exception as e:
+                import logging
+                logging.getLogger("core.db").warning("列补齐失败（降级）: %s: %s", ddl, e)
 
 
 async def _pg_fetchall(conn, sql, params=()):
@@ -156,6 +169,23 @@ async def _sqlite_init():
         script = f.read()
     await conn.executescript(script)
     await conn.commit()
+    # TASK-022 / F1: 旧库在线补齐列（schema_sqlite.sql 的 CREATE IF NOT EXISTS
+    # 不会给已存在的表加列）：skills.updated_at + mcp_servers.env（JSON 文本，
+    # 与 PG 侧 JSONB 在 API 层统一反序列化，双后端行为一致）。
+    for ddl in (
+        "ALTER TABLE skills ADD COLUMN updated_at TEXT DEFAULT (datetime('now'))",
+        "ALTER TABLE mcp_servers ADD COLUMN env TEXT DEFAULT '{}'",
+    ):
+        try:
+            await conn.execute(ddl)
+            await conn.commit()
+        except Exception as e:
+            if "duplicate column" in str(e).lower():
+                pass  # 列已存在（幂等）
+            else:
+                import logging
+                logging.getLogger("core.db").warning("sqlite 列补齐失败（降级）: %s: %s", ddl, e)
+                await conn.rollback()
 
 
 async def _sqlite_fetchall(conn, sql, params=()):
