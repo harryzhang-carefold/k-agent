@@ -898,3 +898,74 @@ interpreted as an integer)`。sqlite 模式正常（200/400）。
 | `agp_test.db` | 隔离自测 SQLite 库（全新，跑前清库） |
 | `uvicorn.log` | 隔离服务（18099）运行日志 |
 | `shots/01..13_*.png` | 各页面真实截图（dashboard/memory/3d+子图/btree/walk/ext skills+mcp/model 配置+保存+viewer） |
+
+---
+
+# TASK-026 修复记录：BUG-006（P1，F1 前端 skills 上传导入结果展示被 loadExt() 重渲染清空）
+
+## 1. 缺陷与根因
+`src/static/ext.js` `extDoUpload()`：上传成功后先 `_renderUploadRes(j)`（把"✓ 完成：新增 N · 跳过 N · 失败 N"+明细渲染进 `#sk-up-res`，位于 `#sk-upload` 内），紧接 `await loadExt()` **整块重渲染 `#page-ext`**——其中重新生成一个**空的、`hidden` 的 `#sk-upload`**，把刚渲染的导入结果面板**整体清空**。后果：用户导入后只看到列表新增，永远看不到 新增/跳过/失败 汇总；重名/失败场景下零反馈（误以为全部成功）。BUG-006 由 TASK-024 发现、TASK-025 PM 终审独立复现确认（`03-testing/BUGS.md` §BUG-006）。
+
+## 2. 修复方式（任务书选项 1 的实现：结果落在不会被重渲染的节点内）
+```js
+// 修复前
+_renderUploadRes(j);
+await loadExt();        // ← 整块重渲染 #page-ext，#sk-upload 被重生为空 hidden → 结果被清空
+
+// 修复后（仅改 extDoUpload() 一处）
+_renderUploadRes(j);
+// 不再 loadExt() 整块重渲染；仅局部刷新 skills 列表：
+_skillQ = '';
+const sk = await api('/api/ext/skills').catch(() => ({ skills: [] }));
+_skills = sk.skills || [];
+const qInput = $('#sk-q'); if (qInput) qInput.value = '';
+const list = $('#sk-list'); if (list) list.innerHTML = _skillListHTML(canManage());
+```
+**为什么"最后渲染/最终可见的是导入结果"**：`_renderUploadRes(j)` 渲染结果后，上传流程**不再触碰** `#sk-upload`（不再被 `loadExt()` 重生成），结果面板在整个流程完成后**原样保留、稳定可见**——最终状态就是结果面板。列表同步改为**局部刷新**（重拉 `/api/ext/skills` + 重绘 `#sk-list` + 复位搜索框）：新增技能立即出现在列表（含计数），搜索框回空态（与全量刷新语义一致），上传区/结果面板不被覆盖。重名/失败/空内容明细全部可见，消除"零反馈"。
+**约束合规**：纯 JS 零框架零依赖、无 CDN；仅改 `extDoUpload()` 一处，其余功能（新建/编辑/删除/搜索/MCP/Plugins/长文本）零改动。
+
+## 3. 提交
+- 分支 `feat/ui-tools`，commit `5c5cbef`（接 `d6ed696`），工作树 clean；`node --check src/static/ext.js` 语法 OK。
+
+## 4. 自测（混合文件：新技能 + 重名 + 不支持扩展名 + 空内容）
+- 隔离容器（RISK-015 铁律：docker run 独立容器名+端口，未动线上 agp-app:8099/8081/13 权限矩阵）：
+  - `t026-sqlite` **:8399**（全新卷，DB_BACKEND=sqlite）
+  - `t026-pg` **:8499**（agp_default 网络，DB_BACKEND=postgres → 共享 pg-unified/agp）
+  - 镜像 `agp-platform:1.2.1-t026` 从含修复的 `src/` 独立重建（`grep BUG-006 /app/static/ext.js` = 1 命中，确认修复在镜像内）。
+- Playwright（chromium headless，真实登录 admin → MCP-Skills 页 → 上传导入 → 开始导入），**双后端各 12/12 PASS**（0 console/page 错误）：
+  - `skills.upload-result-display`（#sk-upload 可见 + 含 新增/完成/跳过/失败）✅
+  - `result.summary-line`（✓ 完成：新增 1 · 跳过 2 · 失败 1）✅
+  - 明细断言：重名（医疗问答规范）/ 空内容 / 不支持类型 / 新增（t026-selftest-skill）✅
+  - **`result.stable-after-wait`**（2.5s 后结果面板仍可见，无异步清空）✅
+  - 列表刷新：新技能落库 + "共 N 个"计数行 ✅；无文件→错误提示（回归护栏）✅
+- 结果面板最终文本（双后端一致）：
+  ```
+  ✓ 完成：新增 1 · 跳过 2 · 失败 1
+  新增成功（1）「t026-selftest-skill」 — t026_new_skill.md
+  跳过（重名/空内容）（2）「医疗问答规范」 — 重名，库内已存在（医疗问答规范.md）
+                 「t026-empty」 — 空内容（t026_empty.txt）
+  失败（类型/大小）（1） — 不支持的文件类型或空 zip（仅 .md/.txt 或含此类文件的 zip）
+  ```
+- 视觉确认：`05-temp/t026/shots/01_upload_result.png`（sqlite）+ `shots/pg01_upload_result.png`（PG）。
+
+## 5. 部署说明
+- **未动线上**：agp-app(:8099, `agp-platform:1.2.0-dual`)、8081 网关、13 权限矩阵均未触碰；生产切换（compose up -d 替换线上）**归后续交付卡**（需 TASK-027 回归 PASS 后由褚岩放行，同 TASK-025 守门模式）。
+- 临时测试容器 t026-sqlite/t026-pg（:8399/:8499）**保留至 TASK-027 回归**（云天明可复用验证），非生产、非常驻；sqlite 为独立新卷；**PG 共享 schema 自测行已清空**（agp.skills 回到 seed 2 条：医疗问答规范/工具调用规范）。
+- SERVER_REGISTRY.md 已登记本卡（2026-09-15 TASK-026 行）。
+
+## 6. 给 TASK-027（云天明回归）的提示
+1. **回归重点**：`skills.upload-result-display` + 重名/失败/空内容场景，双后端（sqlite+PG）+ Playwright UI **连跑 2 次**确认无 flake。
+2. 可额外验证：导入后在搜索框输入/清空，结果面板仍在（`#sk-up-res` 不在 `extFilterSkills` 重绘范围，应稳定）。
+3. 若走全量 `loadExt()`（切页面再回来），`#sk-upload` 回空 hidden 态是**设计如此**（与修复前一致）——BUG-006 验收口径是"导入流程完成后结果可见且稳定"，非"跨页面导航后仍保留"。
+4. 复用容器：t026-sqlite(:8399) / t026-pg(:8499) 已健康运行；PG 端若重跑需先清 agp.skills 的 t026 行（或换新 name 文件）。
+
+## 7. 自测证据索引（05-temp/t026/）
+| 文件 | 内容 |
+|---|---|
+| `t026_ui_test.js` / `t026_ui_test_pg.js` | Playwright 自测脚本（sqlite / PG 双后端） |
+| `t026_ui_results.json` / `t026_ui_results_pg.json` | 断言结果（各 12/12 PASS）+ upload API 响应 + page_errors |
+| `t026_selftest_evidence.md` | 完整自测证据（修复方式 + 双后端明细 + 视觉确认） |
+| `shots/01_upload_result.png` / `shots/pg01_upload_result.png` | 导入结果面板截图（双后端，视觉确认） |
+| `shots/02_stable_after_2_5s.png` / `shots/03_list_after_upload.png` | 稳定性 + 列表刷新截图 |
+| `files/` | 4 个混合测试文件 |
+| `clean_pg_t026.py` | PG 共享 schema 自测行清理脚本（凭据走容器内 .env，不上命令行） |
