@@ -797,3 +797,104 @@ interpreted as an integer)`。sqlite 模式正常（200/400）。
 | `fullsuite.log` | pytest 全量回归（100 passed, 5 存量失败）输出 |
 | `smoke.db` | 手工功能冒烟 sqlite 库（upload/mcp 全路径，跑完保留备查） |
 | `probe_env.sh` | PG mcp_servers.env 列存储探针（jsonb 键序确认） |
+
+---
+
+# TASK-023 交付记录：前端 — MCP-Skills-Plugins 页 + 记忆页（L0/L1/L2 + 3D + B+树 + 多跳）+ 模型节点配置页
+
+> 分支：`feat/ui-tools`（续 TASK-021/022）。本卡只做**前端**（纯 JS、零框架、离线，DECISION-001 无 CDN）；
+> 后端 F1/F3 已完成（TASK-022 / TASK-021），本卡不碰 src/routers/、RBAC 矩阵、端口、网关、8099 线上容器。
+
+## 1. 功能范围（对应任务书 F1 / F2 / F3）
+
+### 1.1 F1 — 扩展能力页（`ext`，`ext.js`）
+- **Skills 管理**：列表（搜索、名称/描述/来源/更新时间）、新建、编辑、删除、**上传导入**
+  （`.md` / `.txt` / zip 目录，走 `POST /api/ext/skills/upload`，重名"跳过并回报"提示，对应 TASK-022 新增端点）。
+- **MCP 管理**：列表（启停开关）、新建、编辑（含 **env KV 行编辑**）、**tools/call 输出**列、删除
+  （引用 409 时提示解绑）。对应 TASK-022 的 PUT/DELETE + env 持久化。
+- **Plugins（内置只读）+ 长文本（Longtext）**：保留既有面板。
+
+### 1.2 F2 — 记忆页（`memory`，`memory.js` + `graph3d.js`）
+4 个 Tab：
+- **列表**：L0 对话 / L1 记忆 / L2 图节点 三张表（后端已就绪）。
+- **3D 图**：自研 **纯 Canvas-2D 三维力导向图**（`graph3d.js`，318 行，离线无依赖，满足 DECISION-001）：
+  - Fruchterman-Reingold 3D 布局 + 视角透视投影 + 拖拽旋转 / 滚轮缩放 / 悬停高亮。
+  - **点击节点 → `onNodeClick` → `GET /api/memory/l2/subgraph?start=&hops=2`**，渲染子图节点/边/摘要到详情面板，
+    并高亮 2 跳邻居（中心节点光晕、邻接边高亮）。
+- **B+ 树**：bucket 分桶可视化 + 触发一次真实 bucket 读（展示"共 N 条"）。
+- **多跳**：保留既有文本多跳问答输入。
+
+### 1.3 F3 — 模型节点配置页（`model`，`config.js`）
+- **LLM 卡片** + **Embedding 卡片**：9 白名单字段表单（base_url / model / api_key / timeout / retries / dim）。
+- **密钥指示**：只读展示 `key_set` + `key_tail`（末 4 位），**永不回显明文**（对应 TASK-021 脱敏）。
+- **测试连接**：`POST /api/system/config/test`，显示延迟 / HTTP 码 / model 列表或向量 dim。
+- **保存**：`POST /api/system/config`，**只提交实际变更的字段**（避免覆盖合法的留空字段，如 local-hash 模式下
+  embedding 的 `base_url`）。RBAC：viewer 角色无 `system:admin`，**隐藏保存按钮**。
+
+## 2. 代码组织
+
+| 文件 | 行数 | 说明 |
+|---|---|---|
+| `src/static/graph3d.js` | 318 | 新增：纯 JS 3D 力导向图引擎（window.Graph3D） |
+| `src/static/ext.js` | 431 | 新增：Skills/MCP/Plugins/Longtext（window.loadExt） |
+| `src/static/memory.js` | 329 | 新增：记忆 4-Tab 页（window.loadMemory / memTab） |
+| `src/static/config.js` | 167 | 新增：模型节点配置页（window.loadConfig） |
+| `src/static/index.html` | 62 | 改：nav 加 `model` 页 + `<div id="page-model">` + 4 个新 `<script>` 标签 |
+| `src/static/app.js` | 436 | 改：LOADERS / PAGE_PERMS 加 `model`；memory/ext loader 指向 window 全局；移除旧的 inline loadMemory/walkGraph/bucketDemo/loadExt 及其助手（避免重复全局冲突） |
+| `src/static/style.css` | 103 | 改：记忆 Tab / 3D canvas / B+树 / 缓存徽标样式 |
+
+> 设计：新逻辑拆 4 个独立模块文件，各自暴露 `window` 全局；旧 inline 实现从 `app.js` 移除，避免同名全局碰撞。
+> 复用 `app.js` 既有全局：`api()`、`esc()`、`$`、RBAC 守卫（`PAGE_PERMS` / `LOADERS`）。
+
+## 3. 自测结果（真实运行，无 mock，隔离环境）
+
+### 3.1 隔离自测环境（不碰线上 8099）
+- uvicorn 起在 `127.0.0.1:18099`，`DB_BACKEND=sqlite`，**全新** SQLite 库 `05-temp/t023/agp_test.db`（跑前 `rm -f` 清库）。
+- 线上 `agp-app` 容器（8099）全程未动。
+
+### 3.2 无头 Chromium 自测（Playwright，`05-temp/t023/selftest.py`）— **26/26 全绿**
+| 断言 | 结果 |
+|---|---|
+| login（admin / super_admin） | PASS |
+| nav-has-model（7 页：dashboard/agents/chat/rag/users/memory/ext/**model**） | PASS |
+| dashboard + 4 页回归（agents/chat/rag/users） | PASS |
+| memory-tabs（list/g3d/btree/walk） | PASS |
+| memory-list-l0 | PASS |
+| memory-3d-canvas / painted（canvas 真实绘制 dataurl 54414B）/ nodes-exist（7 节点） | PASS |
+| **memory-3d-subgraph（真实 mouse.click 命中节点 V20260909 → 子图渲染）** | **PASS（交互命中 clicked=True）** |
+| memory-btree-records（"共 N 条"） | PASS |
+| memory-walk | PASS |
+| ext-skills-list / **skill-create**（2→3，无报错） | PASS |
+| ext-mcp-list / **mcp-create**（1→2，含 env KV）/ **mcp-toggle** / **mcp-delete** | PASS |
+| model-page（LLM base + emb dim 字段在） | PASS |
+| **model-test-llm**（真实 vLLM 连通：✓ 延迟 883ms HTTP 200; models:['vllm-qwen3.8-27b']） | PASS |
+| **model-save**（llm_retries 3→4，**经 API 验证服务端持久化 persisted=True**） | PASS |
+| **model-viewer-nosave**（viewer 角色保存按钮隐藏） | PASS |
+| no-page-errors（全程 0 console 错误） | PASS |
+
+### 3.3 关键 bug 修复（自测发现）
+- **3D 节点点击无法选中**：`graph3d._pick()` 原用 `n.r` 作命中半径，但投影节点对象 `{node,sx,sy,scale,z}`
+  根本没有 `r` 字段 → 半径恒为 `NaN` → 任何点击都落空。修复为与绘制一致的屏幕半径
+  `Math.max(6,(node.r||6)*scale)+4`（`graph3d.js` `_pick`）。修复后真实 mouse.click 直接命中并拉出 2 跳子图。
+
+## 4. 部署说明（本卡不重建镜像/不重启线上 agp-app）
+- 代码在 `feat/ui-tools` 分支；静态文件由后端 `StaticFiles` 直出。**线上 agp-app 仍为旧镜像**，
+  前端新页面需随 TASK-025 镜像重建（`agp-platform:1.2.x` 重建 + compose up）后才在 8099 生效。
+- 本卡自测在隔离 18099 + 全新 SQLite 上验证，**未触碰** 8099/8081//agent/、13 权限矩阵、RBAC。
+- 前端零新增依赖（纯 JS + Canvas-2D），无 npm/CDN，Dockerfile/compose 无需改动。
+- SERVER_REGISTRY.md 无端口/容器/组件变更（纯静态资源 + 既有 8099 服务），无需台账变更。
+
+## 5. 已知问题
+1. 前端新页面（ext 上传/编辑、memory 3D、model 配置）在**线上 agp-app 旧镜像**中不可用，需 TASK-025 重建镜像后生效（分支代码已就绪）。
+2. 存量 5 个 chat/WS 集成用例失败（llm_calls==0，打线上 8099 旧镜像容器）与 TASK-021/022 同根因，非本卡引入。
+3. 3D 视图为纯 Canvas-2D 透视投影（非 WebGL/three.js），满足离线约束；节点数较大时（>~150）力导向 O(n²) 会偏慢，
+   当前 demo 数据 7 节点无压力。
+
+## 6. 自测证据索引（05-temp/t023/）
+| 文件 | 内容 |
+|---|---|
+| `selftest.py` | 无头 Chromium 自测脚本（26 断言，26/26 全绿） |
+| `verify3dclick.py` | 3D 节点点击→子图专项验证（真实 mousedown/mouseup，子图 7 节点 8 边全渲染） |
+| `agp_test.db` | 隔离自测 SQLite 库（全新，跑前清库） |
+| `uvicorn.log` | 隔离服务（18099）运行日志 |
+| `shots/01..13_*.png` | 各页面真实截图（dashboard/memory/3d+子图/btree/walk/ext skills+mcp/model 配置+保存+viewer） |

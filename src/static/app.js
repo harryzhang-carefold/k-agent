@@ -33,6 +33,7 @@ const PAGE_PERMS = {
   dashboard: [], agents: [], chat: [],
   rag: ['rag:read'], users: ['role:manage', 'user:manage'],
   memory: ['memory:read'], ext: ['ext:manage', 'agent:read'],
+  model: [],  // 模型节点页：登录即可查看（只读摘要）；保存/测试由页面内 system:admin 守卫
 };
 function can(page) {
   if (!me) return false;
@@ -69,7 +70,9 @@ async function enterMain() {
 
 const LOADERS = {
   dashboard: loadDashboard, agents: loadAgents, chat: loadChat,
-  rag: loadRag, users: loadUsers, memory: loadMemory, ext: loadExt,
+  rag: loadRag, users: loadUsers,
+  // memory/ext/model 由独立模块 memory.js / ext.js / config.js 提供（window 全局）
+  memory: loadMemory, ext: loadExt, model: loadConfig,
 };
 function goto(page) {
   if (!can(page)) return;
@@ -414,156 +417,11 @@ async function editRole(id, perms) {
   } catch (e) { alert(e.message); }
 }
 
-// ---- 记忆（三层 + 立体图 + B+树）----
-async function loadMemory() {
-  const [l0, l1, nodes, edges, events, be] = await Promise.all([
-    api('/api/memory/l0?limit=15'), api('/api/memory/l1'),
-    api('/api/memory/l2/nodes'), api('/api/memory/l2/edges'),
-    api('/api/memory/l2/events'), api('/api/memory/backend'),
-  ]);
-  const b = be.current || {};
-  $('#page-memory').innerHTML =
-    '<h2>记忆（三层插件，与 agent 解耦）</h2>' +
-    '<div class="grid">' +
-    '<div class="card"><div class="k">当前后端</div><div class="v">' + esc(b.name||'') +
-      '</div><div class="k">' + (b.stub ? '适配位存根' : '真实 local') + ' · 节点 ' +
-      (b.graph_nodes||0) + ' · 边 ' + (b.graph_edges||0) + '</div></div>' +
-    '<div class="card"><div class="k">可插拔适配器</div>' +
-      '<div class="k">' + Object.entries(be.adapters||{})
-        .filter(([k]) => k !== 'current')
-        .map(([k, v]) => '<span class="tag ' + (v.stub ? 'warn' : 'ok') + '">' + k +
-        (v.stub ? '·存根' : '') + '</span>').join(' ') + '</div>' +
-      '<div class="k">切换: .env MEMORY_BACKEND=local|redis|milvus|neo4j|hermes</div></div>' +
-    '</div>' +
-    '<div class="panel"><h3>L2 立体图（双向属性图 · 免索引邻接）</h3>' +
-    '<div class="row">' +
-    '<div><label>多跳遍历起点</label><input id="g-start" value="P001"></div>' +
-    '<div><label>跳数</label><input id="g-hops" type="number" value="2"></div>' +
-    '<div style="align-self:flex-end"><button class="small" onclick="walkGraph()">遍历</button>' +
-    '<button class="small" onclick="bucketDemo()">B+ 树分桶演示</button></div></div>' +
-    '<div id="g-out"></div></div>' +
-    '<div class="panel"><h3>事件节点（Visit 多对多降维）</h3><pre id="ev-out">' +
-    esc(JSON.stringify(events.events, null, 2)) + '</pre></div>' +
-    '<div class="panel"><h3>节点 / 边（四要素：起/止/类型/属性）</h3>' +
-    '<div class="k">节点 ' + nodes.nodes.length + ' · 边 ' + edges.edges.length + '</div>' +
-    '<pre>' + esc(edges.edges.map(e => '(' + e.src + ')-[:' + e.type + ' ' +
-      JSON.stringify(e.props) + ']->(' + e.dst + ')').join('\n')) + '</pre></div>' +
-    '<div class="panel"><h3>L1 语义缓存（' + l1.count + ' 条）</h3><pre>' +
-    esc(l1.l1.map(x => x.text + '  =>  ' + (x.answer||'').slice(0, 60)).join('\n')) + '</pre></div>' +
-    '<div class="panel"><h3>L0 原始行为记录（不降噪，' + l0.count + ' 条）</h3><pre>' +
-    esc(l0.l0.map(x => '[' + x.ts + '] agent' + x.agent_id + ' IN: ' + (x.input||'').slice(0,50) +
-      ' | OUT: ' + (x.output||'').slice(0,50)).join('\n')) + '</pre></div>';
-}
-async function walkGraph() {
-  try {
-    const r = await api('/api/memory/l2/subgraph?start=' +
-      encodeURIComponent($('#g-start').value) + '&hops=' + $('#g-hops').value);
-    $('#g-out').innerHTML = '<h4>路径: ' + esc(r.path.join(' → ')) +
-      '</h4><pre>' + esc(r.bfs.map(e => '(' + e.src + ')-[:' + e.type + ' ' +
-      JSON.stringify(e.props) + ']->(' + e.dst + ')').join('\n')) + '</pre>' +
-      '<h4>子图摘要（最终问题只查摘要，不回顾原文）</h4><pre>' + esc(r.summary) + '</pre>';
-  } catch (e) { $('#g-out').innerHTML = '<div class="err">' + esc(e.message) + '</div>'; }
-}
-async function bucketDemo() {
-  try {
-    const dims = ['date', 'entity', 'topic', 'process'];
-    let out = '';
-    for (const d of dims) {
-      const r = await api('/api/memory/l2/bucket?node=P001&dim=' + d);
-      out += '【' + d + ' 桶】' + JSON.stringify(r.records) + '\n';
-    }
-    $('#g-out').innerHTML = '<pre>' + esc(out) +
-      '\nB+ 树正确性: 按 key 有序插入 → 中序遍历有序（tests 断言）；按日期 2026-09-09 检索只返回当日条目。</pre>';
-  } catch (e) { $('#g-out').innerHTML = '<div class="err">' + esc(e.message) + '</div>'; }
-}
+// ---- 记忆：由 memory.js 提供（loadMemory + 列表/3D/B+树/多跳 四视图）----
+// 此处不再内联实现，避免与 memory.js 的 window 全局重复。
 
-// ---- MCP-Skills ----
-async function loadExt() {
-  const [pl, sk, mc, lt] = await Promise.all([
-    api('/api/ext/plugins'), api('/api/ext/skills'), api('/api/ext/mcp'),
-    api('/api/longtext/hitl'),
-  ]);
-  $('#page-ext').innerHTML =
-    '<h2>MCP-Skills-Plugins</h2>' +
-    '<div class="panel"><h3>Plugins（内置可调用能力）</h3>' +
-    (pl.plugins||[]).map(p => '<div class="card" style="margin-bottom:8px">' +
-      '<strong>' + esc(p.name) + '</strong> <div class="k">' + esc(p.description) + '</div>' +
-      '<button class="small" onclick="callPlugin(\'' + p.name + '\')">调用</button>' +
-      '<pre id="pl-' + p.name + '"></pre></div>').join('') + '</div>' +
-    '<div class="panel"><h3>Skills（指令包 · 注入 prompt 固定左侧）</h3>' +
-    (sk.skills||[]).map(s => '<div class="card" style="margin-bottom:8px"><strong>' +
-      esc(s.name) + '</strong> <div class="k">' + esc(s.description||'') + '</div><pre>' +
-      esc(s.content) + '</pre></div>').join('') + '</div>' +
-    '<div class="panel"><h3>MCP Servers（stdio JSON-RPC · 内置 demo 真实进程）</h3>' +
-    (mc.mcp_servers||[]).map(s => '<div class="card" style="margin-bottom:8px"><strong>' +
-      esc(s.name) + '</strong> <span class="tag ' + (s.enabled ? 'ok' : 'warn') + '">' +
-      (s.enabled ? 'enabled' : 'disabled') + '</span> <div class="k mono">' +
-      esc(s.command) + ' ' + esc(JSON.parse(s.args||'[]').join(' ')) + '</div>' +
-      '<button class="small" onclick="mcpTools(' + s.id + ')">tools/list</button>' +
-      '<button class="small" onclick="mcpCall(' + s.id + ',\'get_time\')">call get_time</button>' +
-      '<button class="small" onclick="mcpCall(' + s.id + ',\'get_patient_demo\')">call get_patient_demo</button>' +
-      '<pre id="mcp-' + s.id + '"></pre></div>').join('') +
-    '<div class="k">适配位说明: 外部真实 MCP 进程 = mcp_servers 表配置 command/args 即可接入（DECISION-002）</div></div>' +
-    '<div class="panel"><h3>长文本 4 策略</h3>' +
-    '<div class="row">' +
-    '<div><label>长文本（策略1/2 输入）</label><textarea id="lt-text" rows="5">' +
-    '患者王建国，52岁。2026-07-14 门诊：FEV1 2.10 L，IgE 410.20 KU/L，控制不佳，加用孟鲁司特。' +
-    '2026-09-09 门诊：支气管舒张试验阳性，FEV1 改善 240 ml，IgE 394.00 KU/L，尘螨皮试阳性。' +
-    '医嘱：布地奈德/福莫特罗吸入，氯雷他定口服。' +
-    '</textarea></div></div>' +
-    '<button class="small" onclick="ltRun(\'map-reduce\')">策略1 Map-Reduce</button>' +
-    '<button class="small" onclick="ltRun(\'incremental-graph\')">策略2 增量图构建</button>' +
-    '<button class="small" onclick="ltRun(\'critique-refine\')">策略3 critique-refine</button>' +
-    '<button class="small" onclick="ltPreprocess()">策略4 pandas 预处理</button>' +
-    '<pre id="lt-out"></pre>' +
-    '<h4>HITL 人工待办队列（' + lt.count + '）</h4><pre>' +
-    esc((lt.hitl||[]).map(h => '[' + h.status + '] ' + h.task + ' — ' + h.reason).join('\n') || '(空)') +
-    '</pre></div>';
-}
-async function callPlugin(name) {
-  try {
-    const r = await api('/api/ext/plugins/' + name + '/call',
-      { method: 'POST', body: JSON.stringify({ arguments: {} }) });
-    document.getElementById('pl-' + name).textContent = JSON.stringify(r, null, 2);
-  } catch (e) { document.getElementById('pl-' + name).textContent = e.message; }
-}
-async function mcpTools(id) {
-  try {
-    const r = await api('/api/ext/mcp/' + id + '/tools');
-    document.getElementById('mcp-' + id).textContent =
-      JSON.stringify({ tools: r.tools }, null, 2);
-  } catch (e) { document.getElementById('mcp-' + id).textContent = e.message; }
-}
-async function mcpCall(id, tool) {
-  try {
-    const r = await api('/api/ext/mcp/' + id + '/tools/' + tool + '/call',
-      { method: 'POST', body: JSON.stringify({ arguments: {} }) });
-    document.getElementById('mcp-' + id).textContent = JSON.stringify(r.result, null, 2);
-  } catch (e) { document.getElementById('mcp-' + id).textContent = e.message; }
-}
-async function ltRun(kind) {
-  const out = $('#lt-out');
-  out.textContent = '执行中…（真实调用 LLM，约 10-60s）';
-  try {
-    const body = { text: $('#lt-text').value };
-    if (kind === 'incremental-graph') body.center = '王建国';
-    const r = await api('/api/longtext/' + kind, { method: 'POST', body: JSON.stringify(body) });
-    out.textContent = JSON.stringify(r, null, 2).slice(0, 3000);
-  } catch (e) { out.textContent = e.message; }
-}
-async function ltPreprocess() {
-  const out = $('#lt-out');
-  out.textContent = '执行中…';
-  const csv = 'patient_id,date,indicator,value,unit\n' +
-    'P001,2026-07-14,FEV1,2.10,L\nP001,2026-07-14,IgE,410.20,KU/L\n' +
-    'P001,2026-09-09,FEV1改善量,240,ml\nP001,2026-09-09,IgE,394.00,KU/L\n' +
-    'P002,2026-08-20,FEV1,1.95,L\nP002,2026-09-05,FEV1,2.02,L\nP002,2026-08-20,IgE,210.50,KU/L\n';
-  try {
-    const r = await api('/api/longtext/preprocess',
-      { method: 'POST', body: JSON.stringify({ csv }) });
-    out.textContent = JSON.stringify(r, null, 2).slice(0, 3000);
-  } catch (e) { out.textContent = e.message; }
-}
+// ---- MCP-Skills-Plugins：由 ext.js 提供（loadExt + Skills/MCP 管理 + Plugins/长文本）----
+// 此处不再内联实现，避免与 ext.js 的 window 全局重复（callPlugin/mcpTools/mcpCall/ltRun 等）。
 
 // ---- 启动 ----
 document.addEventListener('DOMContentLoaded', () => {

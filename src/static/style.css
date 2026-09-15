@@ -82,3 +82,22 @@ pre { background:#0b0f18; border:1px solid #26314d; border-radius:8px; padding:1
 .chat-input button { background:var(--acc); color:#fff; padding:11px 22px; font-weight:600; }
 .cache-badge { display:inline-block; background:#173222; color:var(--ok); border:1px solid var(--ok);
   border-radius:6px; padding:1px 8px; font-size:11px; margin-left:6px; }
+/* ---- TASK-023 新增：记忆 tabs / 3D 立体图 / B+ 树分桶 ---- */
+.mem-tabs { display:flex; gap:8px; margin-bottom:16px; flex-wrap:wrap; }
+.mem-tab { background:var(--panel); color:var(--fg); border:1px solid #2c3a5e;
+  padding:9px 18px; border-radius:8px; font-size:14px; }
+.mem-tab:hover { border-color:var(--acc); }
+.mem-tab.active { background:var(--acc); color:#fff; border-color:var(--acc); }
+.g3d-wrap { position:relative; width:100%; }
+.g3d-canvas { display:block; width:100%; border:1px solid #26314d; border-radius:10px;
+  cursor:grab; touch-action:none; background:#0b0f18; }
+.g3d-canvas:active { cursor:grabbing; }
+.g3d-hint { text-align:center; color:var(--dim); font-size:12px; margin-top:8px; }
+.bt-tree { max-height:340px; overflow:auto; border:1px solid #26314d; border-radius:8px;
+  padding:10px; background:#0b0f18; }
+.bt-node { display:flex; gap:10px; align-items:center; padding:5px 8px; margin-bottom:3px;
+  border-bottom:1px solid #1a2336; font-size:12px; }
+.bt-node:nth-child(odd) { background:rgba(79,140,255,0.04); }
+.bt-idx { flex:0 0 26px; text-align:center; color:var(--dim); background:var(--panel2);
+  border:1px solid #2c3a5e; border-radius:6px; padding:1px 4px; }
+.bt-rec { font-family:ui-monospace,Menlo,Consolas,monospace; word-break:break-all; color:var(--fg); }
