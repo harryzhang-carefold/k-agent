@@ -73,10 +73,25 @@ async def _pg_connect():
 
 
 async def _pg_init():
-    """连通性自检（表由迁移脚本创建，运行时不建/改表，防 schema 漂移）。"""
+    """连通性自检 + TASK-021 settings 表幂等自举（agp schema，CREATE IF NOT EXISTS）。
+
+    建表失败（如权限被收紧）只告警不抛错：settings 持久化降级为纯内存热更新
+    （重启不持久），不阻断应用启动。
+    """
     pool = await connect()
     async with pool.acquire() as c:
         await c.execute("SELECT 1")
+        try:
+            await c.execute(
+                "CREATE TABLE IF NOT EXISTS settings ("
+                " key TEXT PRIMARY KEY,"
+                " value TEXT NOT NULL,"
+                " updated_at TEXT DEFAULT (to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS')))"
+            )
+        except Exception as e:
+            import logging
+            logging.getLogger("core.db").warning(
+                "settings 表创建失败（降级为纯内存配置，重启不持久）: %s", e)
 
 
 async def _pg_fetchall(conn, sql, params=()):

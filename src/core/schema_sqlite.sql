@@ -1,7 +1,7 @@
 -- AI Agent Platform — SQLite schema（固化自 src/data/agp.db 的 sqlite_master）
 -- 导出脚本: 05-temp/gen_schema_sqlite.py（TASK-015, D4）
 -- 幂等：全部 CREATE 带 IF NOT EXISTS；executescript 可重复执行（同一库导入两次不报错）。
--- 包含: 20 张业务表 + 全部索引。不含 sqlite_sequence 等内部对象。
+-- 包含: 21 张业务表 + 全部索引。不含 sqlite_sequence 等内部对象。
 
 -- ==================== TABLES ====================
 CREATE TABLE IF NOT EXISTS agent_bindings (
@@ -132,6 +132,14 @@ CREATE TABLE IF NOT EXISTS roles (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT UNIQUE NOT NULL,
   description TEXT
+);
+
+-- 系统配置持久化（TASK-021 / F3）：key 限 9 项白名单（见 core.app SETTING_KEYS），
+-- value 为 JSON 标量字符串，updated_at 记录最近一次写入。
+CREATE TABLE IF NOT EXISTS settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at TEXT DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS skills (

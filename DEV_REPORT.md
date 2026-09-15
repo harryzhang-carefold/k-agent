@@ -612,3 +612,95 @@ interpreted as an integer)`。sqlite 模式正常（200/400）。
 | `t018_start_sqlite.sh` / `t018_sqlite_app.log` | sqlite 模式 app 启动脚本 + 日志 |
 | `t018_pg_ddl.sql` / `t018_pg_init.sql` | 隔离 PG 容器 agp schema DDL（源自 postgres-unified 迁移） |
 | `t018_compose_check/` | 干净目录 compose config 验证副本 |
+
+---
+
+# TASK-021 交付记录：F3 后端 — settings 表持久化 + config 全字段（脱敏）+ /config/test 连通测试
+
+> 开发：章北海（2026-09-15，t_23bbba48）。分支 `feat/ui-tools`（阶段四首张卡，由本卡创建）。
+> 任务书：`shared/tasks/T-AGP-UI-TOOLS.md` §F3 + 硬性约束；基线 main @ aad7179。
+> 范围：仅 F3 后端（F1/F2 由 t_0f154f9b 下并行卡负责）；未碰 src/static/、skills/mcp 路由、RBAC 矩阵、8099/8081 端口。
+
+## 1. 接口变更摘要
+
+### 1.1 新增 `settings` 表（双后端）
+- 结构：`key TEXT PRIMARY KEY, value TEXT NOT NULL (JSON 标量), updated_at TEXT`。
+- key 白名单 9 个：`llm_base_url, llm_model, llm_api_key, llm_timeout, llm_retries, embedding_base_url, embedding_model, embedding_api_key, embedding_dim`。
+- SQLite：`schema_sqlite.sql` 幂等 `CREATE TABLE IF NOT EXISTS settings`（20→21 表，executescript 两遍不报错）。
+- PG：`db.py::_pg_init` 启动时 `CREATE TABLE IF NOT EXISTS`（agp schema；agp_user 为 schema owner 有 CREATE 权，已验证）。**建表失败只告警不抛错**（降级为纯内存热更新，不阻断启动）。
+- 白名单外 key 一律拒绝（POST 400 / 启动加载时跳过）。
+
+### 1.2 启动加载（DB > .env，DECISION-007 模式）
+`startup()` 在 `init_db()` 后调用 `load_settings_from_db()`：DB settings 逐项覆盖内存 Settings（按类型反序列化，脏值跳过保留 env）。重启后配置不丢。
+
+### 1.3 `GET /api/system/config`（权限维持现状：登录即可）
+- 兼容旧结构：`llm` / `embedding` / `memory_backend` / `semantic_cache_threshold` / `max_tool_rounds` 字段不变（前端 dashboard 不破坏）。
+- 新增 `settings` 段：9 项白名单全字段回显。
+- **脱敏规则**：`llm_api_key` / `embedding_api_key` **永不回传明文**，只回 `{key_set: bool, key_tail: "****" + 末4位}`（key 为空 → `{key_set:false, key_tail:""}`）。
+
+### 1.4 `POST /api/system/config`（权限：`system:admin`，RBAC 不动）
+- 扩展为 9 项白名单全字段可更新；**未提供的字段不变**（部分更新安全）。
+- 类型校验：int/float 必须为正数（否则 400，不落库不热更）；`llm_base_url` 自动 rstrip('/')。
+- 未知字段 → 400。
+- 写入语义：热更新内存 Settings（即时生效，与现状一致）+ 落库持久化（`INSERT ... ON CONFLICT (key) DO UPDATE`，双后端同语义；落库失败仅告警降级内存生效）。
+- 兼容 legacy 字段 `semantic_cache_threshold`（非白名单，仅内存热更，保持 AC-13 旧行为）。
+- 响应含 `updated[]` + 脱敏 `settings` 回显。
+
+### 1.5 新增 `POST /api/system/config/test`（权限：`system:admin`）
+- body：`{"target": "llm"|"embedding", 可选 base_url/model/api_key 覆盖}`；未覆盖参数取当前 Settings 值（即"用当前待保存或已保存的参数"，供"保存前测试"按钮）。
+- 真实连通（httpx，15s 上限，避免用户配 90s 卡死按钮）：
+  - llm：`GET {base_url}/models`（OpenAI 兼容），detail 含 HTTP 码 + 前 5 个 model id；
+  - embedding：`POST {base_url}/embeddings`（4 字符 input "测试"），detail 含 HTTP 码 + 向量 dim。
+- 返回 `{ok, latency_ms, detail}`；**失败不 500**（ok=false + 错误摘要，如 `ConnectError: ...` / `HTTP 401: ...`）。
+- 依赖检查：`httpx` 已在 requirements.txt（无新依赖，未引 numpy 等）。
+
+## 2. 自测结果
+
+### 2.1 pytest（sqlite 全链路，本地 venv，05-temp 隔离库）
+新增 `tests/test_system_config.py`（17 用例，全绿）：
+- GET：无 token 401 / 9 字段全回显 / api_key 脱敏（key_set+末4位，明文零泄漏）
+- POST：viewer 403 / 全 9 字段更新（热更+脱敏回显）/ 部分更新保留其余 / 未知字段 400 / 非法类型 400 / legacy semantic_cache_threshold
+- /config/test：llm ok（真实 HTTP，mock OpenAI 兼容 server）/ embedding ok（dim 校验）/ 不可达 fail 分支（ok=false+摘要，无 500）/ embedding 未配置 / 非法 target 400 / RBAC 401+403
+- 持久化：写库 3 key 直读 SQLite 验证（JSON 值 + updated_at 列）+ **重启模拟**（DB 值覆盖 env，未写字段保留 env 值）
+- 双后端 DDL：sqlite schema 幂等（executescript 两遍）+ PG DDL 结构断言（与 sqlite 同构：key PK / value / updated_at，防漂移）
+
+### 2.2 PG 模式（docker run 隔离容器 t021-pg :8599，连 pg-unified，DECISION-010 合规）
+`05-temp/t021/pg_selftest.sh` **8/8 PASS**：
+1. agp schema settings 表启动自举（21 表，pg-unified 上真实验证）
+2. GET 9 字段 + 脱敏（key_tail=****1111，明文零泄漏）
+3. POST 9 字段全更新 + 脱敏回显
+4. PG 落库 9 行（agp.settings 直查）
+5. /config/test llm：ok=true，25ms，models=['mock-pg-llm']（真实 HTTP 经容器→宿主 mock server）
+6. /config/test embedding：ok=true，6ms，dim 校验
+7. /config/test fail 分支：ok=false + ConnectError 摘要（无 500）
+8. 容器重启：DB settings 覆盖 env（llm_model=pg-persisted-model / timeout=45 / retries=2 / dim=256 / key_tail=****4321）
+自测结束已清空 agp.settings 测试行（不留生产库测试数据）。
+
+### 2.3 全量回归（tests/ 全部用例，本地 venv + 线上 8099 集成）
+- **新增 test_system_config.py 17 用例全绿**（全量套件中同样全绿，76 passed）。
+- 既有 79 用例中 74 passed；**5 个失败为存量环境问题，与本卡无关**（已用 main 基线 aad7179 工作树复现验证：零改动代码跑出完全相同的 5 个失败）：
+  - test_agents_chat_rag.py::test_chat_real_llm / test_chat_semantic_cache_hit / test_chat_different_topic_misses_cache / test_chat_tool_get_time_real
+  - test_memory_mcp_longtext_ws.py::test_ws_streaming_and_cache_hit
+  - 共性：`llm_calls == 0`——这些用例打**线上 8099 容器**（旧镜像 `agp-platform:1.2.0-dual`），其 LLM 调用路径当前降级（vLLM 本身 200 可达，问题在线上容器运行态）。本卡代码未部署到线上容器（镜像重建归 TASK-025），工作树改动不可能影响该容器。
+  - **提醒云天明**：这 5 个失败在 TASK-024 增量测试前需先排查线上 agp-app 的 LLM 运行态（重启容器或查日志），否则回归基线不干净。
+
+## 3. 部署说明（本卡不重建镜像/不重启线上 agp-app）
+- 代码在 `feat/ui-tools` 分支；**线上 agp-app 仍为 `agp-platform:1.2.0-dual` 旧镜像**（无 settings 端点），镜像重建 + compose up 归 TASK-025（褚岩终审卡，任务书硬性约束 7：镜像 1.2.0 重建 + 8081 /agent/ 验证）。
+- 旧镜像兼容：`settings` 表在 PG 由新代码启动自举，旧镜像不依赖该表（只读 20 表），重建前后均无风险。
+- 台账（SERVER_REGISTRY.md）已登记：agp schema 20→21 表（settings）+ 自举机制。
+- 端口/网关/RBAC 零变更（8099/8081//agent/ 不动，13 权限矩阵不动）。
+
+## 4. 已知问题
+1. **embedding_dim 热更的局限**：`llm/embedding.py` 模块加载时 `DIM = S.EMBEDDING_DIM` 快照，改 dim 后 local 哈希向量维度下次重启才生效（远端向量按响应 dim 动态 resize，不受影响）。语义缓存阈值/其它字段热更正常。记录备查，不影响本卡验收（F3 要求"与现状一致"，现状即此行为）。
+2. 线上 agp-app 未重建镜像前，`/api/system/config/test` 与 settings 持久化在生产容器内不可用（分支代码已就绪，等 TASK-025 重建）。
+3. `settings` 表若被外部误删：启动时 sqlite 幂等重建 / PG 自举重建（CREATE IF NOT EXISTS），仅丢失已持久化配置（回退 env 值）。
+4. **测试基建提示（供 TASK-024 参考）**：`test_system_config.py` 是进程内自包含测试（TestClient 起独立 app 实例），对导入顺序敏感——`core.config.S` 只在模块导入时从 env 求值一次，fixture 内已就地强制 `DB_BACKEND=sqlite` + 9 白名单基准值，**与全量套件里其它文件先导入 core.config（读 .env 的 postgres 配置）无关**。新增进程内测试时勿依赖 monkeypatch.setenv 影响已建模块的 S。
+5. **存量 5 个 chat/WS 集成用例失败**（llm_calls==0，打线上 8099 容器）：本卡已验证 main 基线同样失败，属线上 agp-app LLM 运行态问题，需 TASK-024 前排查。
+
+## 5. 自测证据索引（05-temp/t021/）
+| 文件 | 内容 |
+|---|---|
+| `pg_selftest.sh` / `pg_selftest_output.log` | PG 模式隔离容器自测脚本 + 8/8 全绿输出（含 raw 响应） |
+| `mock_openai.py` | OpenAI 兼容 mock server（/v1/models + /v1/embeddings，供 /config/test 真实连通） |
+| `check_pg_perms.sh` | agp schema owner/CREATE 权前置验证（agp_user=owner，has CREATE=t） |
+| `test_config_db_*.db` | pytest sqlite 测试库（每进程一份，跑完自清理） |
