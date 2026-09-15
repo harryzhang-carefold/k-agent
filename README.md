@@ -14,6 +14,9 @@
 | **MCP** | stdio JSON-RPC 客户端（initialize → tools/list → tools/call），外部 MCP 进程配置表接入；内置插件注册表（get_time/mcp_call/echo）作为 tool 暴露给 LLM |
 | **长文本 4 策略** | Map-Reduce 提取 / 增量图构建 / 批判-精炼 / 确定性预处理（同名指标单位冲突强制"需人工复核"） |
 | **RBAC** | JWT HS256 + 13 权限 × 4 角色（admin/developer/user/viewer），路由级守卫 |
+| **工具管理（阶段四）** | Skills 管理（增删改/搜索/**上传导入** 单文件 .md/.txt/zip，**导入结果面板**显示「✓ 完成：新增 N·跳过 N·失败 N」+ 每项明细；BUG-006 已修复）+ MCP 管理（表单/env 键值对/启停/删除） |
+| **记忆可视化（阶段四）** | L0/L1/L2 列表 + 3D 力导向立体图（纯 Canvas-2D 零框架，点击节点→2 跳子图）+ B+ 树分桶可视化 + 多跳 |
+| **模型节点配置（阶段四）** | LLM/Embedding 节点卡片：全字段（脱敏回显 api_key 只回 key_set+末4位）+ 测试连接（真实连通 ok / 失败受控 200+ok:false）+ 持久化（DB>env 优先级，重启不丢） |
 | **API 与前端** | REST `/api/*` + WebSocket `/ws/chat/{agent}/{conv}`（流式）；纯原生 JS SPA（无框架） |
 | **可观测** | `/healthz` 健康检查（含 LLM/embedding/DB/记忆后端状态） |
 
@@ -162,7 +165,7 @@ tests/           pytest 套件（auth/agents/chat/rag/memory/mcp/longtext/ws）
 
 | 项 | 值 |
 |---|---|
-| 镜像 | `agp-platform:1.2.0-dual`（build: `./src/Dockerfile`, python:3.12-slim） |
+| 镜像 | `agp-platform:1.2.0`（build: `./src/Dockerfile`, python:3.12-slim；阶段四含 BUG-006 修复 `5c5cbef`。历史线上为 `1.2.0-dual`） |
 | 容器名 | `agp-app`，`restart: unless-stopped` |
 | 端口 | `8099:8099` |
 | 卷 | `./src/data:/app/data`（持久化 `agp.db`，sqlite 模式重启不丢数据） |
