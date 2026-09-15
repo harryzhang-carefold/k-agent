@@ -191,7 +191,19 @@
       const j = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(j.message || ('HTTP ' + r.status));
       _renderUploadRes(j);
-      await loadExt();
+      // BUG-006: 导入成功后只刷新 skills 列表（#sk-list），不整块重渲染 #page-ext。
+      // 原实现 await loadExt() 会重生成一个空的 hidden #sk-upload，把刚渲染进
+      // #sk-up-res 的导入结果面板整体清空 → 用户永远看不到 新增/跳过/失败 汇总。
+      // 改法（修复要求选项 1 的实现：结果落在不会被重渲染的节点内）：
+      //   保留已渲染的结果面板（#sk-upload/#sk-up-res），仅用局部刷新同步列表，
+      //   导入结果因此稳定可见，列表也同步新增（含重名/失败场景的完整明细）。
+      _skillQ = '';
+      const sk = await api('/api/ext/skills').catch(() => ({ skills: [] }));
+      _skills = sk.skills || [];
+      const qInput = $('#sk-q');
+      if (qInput) qInput.value = '';
+      const list = $('#sk-list');
+      if (list) list.innerHTML = _skillListHTML(canManage());
     } catch (e) {
       res.innerHTML = '<div class="err">导入失败: ' + esc(e.message) + '</div>';
     }
