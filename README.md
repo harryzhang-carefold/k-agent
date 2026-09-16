@@ -17,6 +17,9 @@
 | **工具管理（阶段四）** | Skills 管理（增删改/搜索/**上传导入** 单文件 .md/.txt/zip，**导入结果面板**显示「✓ 完成：新增 N·跳过 N·失败 N」+ 每项明细；BUG-006 已修复）+ MCP 管理（表单/env 键值对/启停/删除） |
 | **记忆可视化（阶段四）** | L0/L1/L2 列表 + 3D 力导向立体图（纯 Canvas-2D 零框架，点击节点→2 跳子图）+ B+ 树分桶可视化 + 多跳 |
 | **模型节点配置（阶段四）** | LLM/Embedding 节点卡片：全字段（脱敏回显 api_key 只回 key_set+末4位）+ 测试连接（真实连通 ok / 失败受控 200+ok:false）+ 持久化（DB>env 优先级，重启不丢） |
+| **LLM endpoint 多维护（阶段五）** | 新表 `llm_endpoints`（双后端幂等）+ `/api/llm-endpoints` CRUD/连通测试/设默认；api_key 只回 `key_set`+末4位（0 明文）；Agent 模型字段改**下拉选择 endpoint**；对话按 endpoint 真实路由 base_url/api_key，endpoint 删除/停用后回退系统默认 `S.LLM_MODEL`（BUG-007 已修复，不崩） |
+| **MCP / 长文本 tooltip（阶段五）** | MCP 配置 + 长文本 4 策略信息 tooltip（纯 CSS hover 原生实现），文案与 `mcp_server_demo.py` 实际参数 / `longtext.py` docstring 逐条核对，窄屏不遮挡 |
+| **Agent 绑定端到端（阶段五）** | Skill/MCP/RAG/**Plugins（动态下拉 GET /api/ext/plugins）** 四选绑定，保存落库 + Prompt 预览体现生效（工具 schema 注入） |
 | **API 与前端** | REST `/api/*` + WebSocket `/ws/chat/{agent}/{conv}`（流式）；纯原生 JS SPA（无框架） |
 | **可观测** | `/healthz` 健康检查（含 LLM/embedding/DB/记忆后端状态） |
 
@@ -165,7 +168,7 @@ tests/           pytest 套件（auth/agents/chat/rag/memory/mcp/longtext/ws）
 
 | 项 | 值 |
 |---|---|
-| 镜像 | `agp-platform:1.2.0`（build: `./src/Dockerfile`, python:3.12-slim；阶段四含 BUG-006 修复 `5c5cbef`。历史线上为 `1.2.0-dual`） |
+| 镜像 | `agp-platform:1.3.0`（build: `./src/Dockerfile`, python:3.12-slim；阶段五含 LLM endpoint 多维护 + BUG-007 修复 `d108944`。历史线上为 `1.2.0-dual`，保留为回滚锚点） |
 | 容器名 | `agp-app`，`restart: unless-stopped` |
 | 端口 | `8099:8099` |
 | 卷 | `./src/data:/app/data`（持久化 `agp.db`，sqlite 模式重启不丢数据） |

@@ -1427,3 +1427,81 @@ DELETE FROM agp.conversations WHERE id IN ('c10bc0e23b248','caa33a8ce9d04','cdf0
    不回归（E）；⑥ system-default 兜底端点仍在（F）。
 3. 共享 pg-unified 残留复原 SQL 见 §4（pg_residue.json），destructive 操作请确认
    后执行（同 TASK-033 遗留：05-temp/t032/pg_contamination_record.json 亦待用户确认）。
+
+
+---
+
+## TASK-036 · 阶段五 PM 独立黑盒复审 + 部署 agp-app(1.3.0) + merge main + 交付（褚岩/PM · 2026-09-16 · t_a905cd00）
+
+> 复审对象：`feat/ui-iter2` @ HEAD `6991110`（含 BUG-007 修复 `d108944` + 文档 `6991110`）。
+> 模式：**独立黑盒，不采信上游（t034 自测 / t035 回归）**——独立重建镜像、独立探针、独立双端容器、独立 Playwright UI。
+
+### 1. 复审结论（先说）
+
+**判定 PASS（P0=0、P1=0）。BUG-007 → ✅ FIXED（双后端 × 同步 POST + 流式 WS 双路径独立确认）。放行进部署。**
+
+| 维度 | 结果 |
+|---|---|
+| 镜像 `agp-platform:1.3.0`（clean 源树独立 `docker build`，tag 同时 `t036`） | `agent_engine.py` md5=`dfb32d9d…f870` **= 源树逐字节一致**；`ext.js`/`app.js`/`longtext.py` 亦逐字节一致；修复分支 `_epk` 同步 L243-246 + 流式 L310-313 均在（`args["model"]=S.LLM_MODEL` 回退 2 处）；`src/*.py` 真实 key 0 命中、JWT 0 命中、`.env` 未进镜像（0）✅ |
+| 需求1（endpoint 多维护 + agent 下拉 + BUG-007 回退） | 双端 11/11 断言 PASS（sqlite :8769 / pg :8869），per-assertion sqlite==pg ✅ |
+| 需求2/3（MCP + 长文本 tooltip） | 双端 UI：hover 出现（display:none→block）、文案逐条核对（RISK-019）、窄屏 480px 不越界 ✅ |
+| 需求4（绑定端到端 + prompt 预览 + plugins 动态下拉） | 双端 UI：model 下拉=endpoint、plugins 动态 3 项、UI 创建 agent 落库、Prompt 预览含 system_prompt+工具 schema ✅ |
+| 线上 8099 E2E（部署后 Playwright 登录 admin 逐条） | REST 11/11 + UI 5/5 PASS ✅ |
+| 约束终检 | 部署前 8099/8081/哮喘未动、RISK-015 docker run 隔离、零硬编码、前端无构建（static/*.js 原生）、临时文件全 05-temp/t036/ ✅ |
+
+### 2. 独立探针 per-assertion（双后端一致）
+
+| 断言 | sqlite | pg | 一致 |
+|---|---|---|---|
+| A 删除 endpoint 后回退（同步，BUG-007 核心） | 106913 / degraded=false / llm_calls=1 | 同 | ✅ |
+| B 停用 endpoint(is_active=0) 后回退（同步） | 53846 / degraded=false | 同 | ✅ |
+| C1 正常 endpoint 不回归（同步） | 149327 / degraded=false | 同 | ✅ |
+| D 假 endpoint（不可达 base_url）受控降级 | degraded=true / 不 500 | 同（重试次数因 settings 污染不同，行为一致） | ✅ |
+| E 旧自由文本 agent（RISK-018） | 221 / degraded=false | 同 | ✅ |
+| F system-default 兜底端点 | 存在 + is_active + =真 vLLM | 同 | ✅ |
+| G 流式路径回退（WS /ws/chat） | 667 / degraded=false | 同 | ✅ |
+| api_key 脱敏 | key_set=true + key_tail=****末4位 + 列表/详情 0 明文 | 同 | ✅ |
+| 旧 agent 编辑不报错（PUT 完整 body） | 200 | 同 | ✅ |
+
+### 3. UI 探针（Playwright，双端逐断言一致）
+
+- **MCP tooltip**：hover 前 `display:none` → hover 后 `display:block`（360×442px）；文案含 `stdio JSON-RPC`/`Content-Length`/`python3`/`/app/mcp/mcp_server_demo.py`/`get_time`/`get_patient_demo`/`tools/list` 逐条命中（与 mcp_client.py + mcp_server_demo.py 事实一致，RISK-019）。
+- **长文本 4 策略 tooltip**：hover 后 `display:block`；文案含 Map-Reduce/2000-3000 token/重叠 10-20%/需人工复核/增量图构建/标准三元组 JSON/MERGE/子图摘要/critique-refine/QAItem/≤5 次/HITL/pandas/patient_id+date 逐条命中（与 longtext.py docstring 一致）。
+- **窄屏 480px**：两 tooltip 出现时 `offscreen_right=false`、`offscreen_bottom=false`（不遮挡、不越界）。
+- **需求4**：model 下拉选项 = `system-default → vllm-qwen3.8-27b`（value=endpoint name）；plugins 动态下拉 = `plugin:get_time / plugin:mcp_call / plugin:echo`（GET /api/ext/plugins）；UI 创建 `t036-ui-agent` 落库成功；Prompt 预览 `GET /api/agents/{id}/prompt` 含 system_prompt 文本 + 工具 schema（体现绑定生效）。页面 0 个 404、0 pageerror。
+
+### 4. 部署（DECISION-012 安全 docker run 两步切换法，未用 deploy.sh 的 --build 二次构建）
+
+1. 记录基线：旧 `agp-app` = `agp-platform:1.2.0-dual` / id `0fa0d16ad…` / healthy / agp_default / 8099。
+2. `docker stop + rm` 旧 agp-app（释放 8099，短暂停机）。
+3. `docker run` 新容器 `agp-app-130`（**`agp-platform:1.3.0`** = 独立验证镜像 `e8c9269bf791`，`--env-file src/.env` + TZ/SQLITE_PATH + `--network agp_default` + `mem 512m / cpus 1.0` + 同数据卷 `./src/data:/app/data` + `--restart unless-stopped`）。
+4. 等 healthy（2s）。
+5. `docker rename agp-app-130 agp-app`。
+6. 验证：`8099 /healthz` ok（PG, pg-unified:agp）/ `8081 /agent/healthz` ok / `agp-app` = `agp-platform:1.3.0`。
+- **回滚锚点 `agp-platform:1.2.0-dual` 镜像保留不删**（线上可随时回滚）。
+- 部署后线上 8099 E2E 验证（Playwright 登录 admin 逐条）：REST 11/11 + UI 5/5 PASS。
+- `docker-compose.yml` image tag 更新 `1.2.0-dual → 1.3.0`（随部署提交，供后续 compose 重建一致；本次部署用手动 docker run，compose 未起）。
+
+### 5. merge main
+
+`feat/ui-iter2` → `main`（fast-forward，`main` 是 `feat/ui-iter2` 祖先）。**不推远程**（遵守"不推远程仓库"约束）。含阶段五 5 提交 + 本卡 compose tag 更新。
+
+### 6. 纪律自检
+
+- 独立重建镜像 + 独立探针 + 独立双端容器（RISK-015 docker run 隔离，全新卷 + 共享 PG），未采信上游 ✅
+- 部署仅在全绿（复审 PASS + 回归 PASS）后执行；终审判定容器与线上隔离（先隔离容器复审，全绿后才动线上）✅
+- 回滚锚点保留；环境保真（24 key env / 网络 / 资源限制一致）✅
+- 零硬编码密钥；前端无改动（本卡仅 compose image tag + README）✅
+- 临时文件全 `05-temp/t036/`（探针/启动器/双端结果 JSON/UI JSON/pg 快照/残留记录/data/shots）✅
+
+### 7. 遗留：共享 pg-unified 测试残留（destructive，待用户确认后执行）
+
+本卡 t036 复审（t036-pg:8869）+ 线上 8099 E2E 在共享 `pg-unified:agp` 引入 **21 conv + 28 msg**（messages.id 1043-1070，逐条核实为 t036/t035 探针产物）。连同历史 t032 settings 污染（llm_timeout=30.0/llm_retries=1）+ t034/t035 残留，精确复原 SQL 汇总于 **`05-temp/t036/t036_pg_residue_restore.sql`**（逐 conv_id 删除，不动既有数据）。**PM 不自行执行共享生产数据的 destructive SQL**（同 TASK-033 遗留，交用户确认后执行）。
+
+### 8. 交付物
+
+- `02-development/README.md`：功能表补阶段五 3 行 + 镜像版本 1.3.0（含 BUG-007 修复）。
+- `02-development/docker-compose.yml`：image tag `1.2.0-dual → 1.3.0`。
+- `00-management/STATUS.md`：阶段五终审结论 + 剩余风险清单更新（本卡）。
+- `03-testing/BUGS.md` BUG-007 维持 FIXED；`03-testing/TEST_REPORT.md` 维持 §TASK-035 PASS。
+- 证据 `05-temp/t036/`（baseline_before.txt / pg_snapshot_*.json / t036_probe.py / t036_ui.js / ws_client.py / 双端+线上结果 JSON / t036_pg_residue*.json / t036_pg_residue_restore.sql / deploy_130.sh / shots/*.png）。
