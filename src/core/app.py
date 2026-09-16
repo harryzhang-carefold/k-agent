@@ -226,9 +226,36 @@ async def sys_config_update(request: Request, user: dict = Depends(require_perm(
             import logging
             logging.getLogger("core.app").warning("settings 落库失败（仅内存生效）: %s", e)
         changed.append(key)
+        # TASK-029: LLM 设置变更时同步 system-default 行，保持
+        # "系统默认 endpoint ≡ S.LLM_* 单值" 不变式（兜底/默认选中项）
+        if key in _LLM_SETTING_KEYS:
+            try:
+                await _sync_system_default(conn)
+            except Exception as e:
+                import logging
+                logging.getLogger("core.app").warning("system-default 同步失败（降级）: %s", e)
     return {"updated": changed,
              "llm": {"base_url": S.LLM_BASE_URL, "model": S.LLM_MODEL},
              "settings": sys_config_view()}
+
+
+# TASK-029: 影响 system-default 的 LLM 设置 key
+_LLM_SETTING_KEYS = {"llm_base_url", "llm_model", "llm_api_key",
+                     "llm_timeout", "llm_retries"}
+
+
+async def _sync_system_default(conn):
+    """把 S.LLM_* 单值快照写回 system-default 行（INSERT ON CONFLICT 幂等）。"""
+    await dbmod.execute(
+        conn,
+        """INSERT INTO llm_endpoints (name, base_url, model, api_key, timeout, retries, is_active)
+           VALUES (?,?,?,?,?,?,1)
+           ON CONFLICT (name) DO UPDATE SET
+             base_url=excluded.base_url, model=excluded.model,
+             api_key=excluded.api_key, timeout=excluded.timeout,
+             retries=excluded.retries, is_active=1, updated_at=excluded.updated_at""",
+        ("system-default", S.LLM_BASE_URL, S.LLM_MODEL, S.LLM_API_KEY,
+         S.LLM_TIMEOUT, S.LLM_RETRIES))
 
 
 def sys_config_view() -> dict:
@@ -301,9 +328,14 @@ async def sys_config_test(request: Request, user: dict = Depends(require_perm("s
 
 
 # ---------------- 路由挂载 ----------------
+# TASK-029: llm_endpoints 路由延迟导入（endpoints.py 依赖本模块的
+# mask_key/persist_setting，放文件尾避免循环导入）
+from routers.endpoints import endpoints as llm_endpoints  # noqa: E402
+
 app.include_router(auth)
 app.include_router(agents)
 app.include_router(ext)
+app.include_router(llm_endpoints)
 app.include_router(chat)
 app.include_router(rag)
 app.include_router(mem)

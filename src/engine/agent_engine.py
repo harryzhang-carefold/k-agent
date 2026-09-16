@@ -195,12 +195,48 @@ class AgentEngine:
         await self._l0(agent["id"], text or "[image]", answer)
         return result
 
+    # ---------------- endpoint 解析（TASK-029 / 需求1） ----------------
+    async def _endpoint_kwargs(self, agent: dict) -> dict:
+        """按 agent.model 解析 llm_endpoints（存 endpoint **name**）。
+
+        返回传给 llm.chat/chat_stream 的覆盖参数 {base_url, api_key, timeout}。
+        向后兼容（RISK-018）：model 为空 / 查不到 / 未启用（is_active=0）/
+        端点已删 → 返回 {}（回退 S.* 单端点，不崩）。
+        旧 agent 的 model 是自由文本（如 vllm-qwen3.8-27b），匹配不到
+        endpoint 名时同样回退 S.*，不报错。
+        """
+        model = agent.get("model")
+        if not model:
+            return {}
+        try:
+            row = await db.fetchone(
+                self.conn,
+                "SELECT * FROM llm_endpoints WHERE name=? AND is_active=1",
+                (model,))
+        except Exception:
+            return {}  # 表不可用等异常 → 回退 S.*
+        if not row:
+            return {}
+        kw = {"base_url": row["base_url"],
+              "timeout": float(row["timeout"] or S.LLM_TIMEOUT)}
+        # model 覆盖：agent.model 存的是 endpoint **name**（绑定标识），
+        # LLM payload 的 model 字段必须是 endpoint 行的 model 标识（如
+        # vllm-qwen3.8-27b）——否则 vLLM 404 "model does not exist"
+        if row.get("model"):
+            kw["model"] = row["model"]
+        # api_key 为空时不传（provider 回退 S.LLM_API_KEY 共享 key——
+        # 指向同一 vLLM 集群的端点常见场景）；显式配置了 key 才覆盖
+        if row.get("api_key"):
+            kw["api_key"] = row["api_key"]
+        return kw
+
     async def _tool_loop(self, messages: list[dict], agent: dict, mcp_row: dict | None,
                          on_token=None) -> str:
         args = {"temperature": agent["temperature"], "max_tokens": agent["max_tokens"],
                 "top_p": agent["top_p"]}
         if agent.get("model"):
             args["model"] = agent["model"]
+        args.update(await self._endpoint_kwargs(agent))  # TASK-029: endpoint 覆盖
         content = ""
         for _round in range(S.MAX_TOOL_ROUNDS):
             content = await llm.chat(messages, **args)
@@ -261,6 +297,7 @@ class AgentEngine:
                 "top_p": agent["top_p"]}
         if agent.get("model"):
             args["model"] = agent["model"]
+        args.update(await self._endpoint_kwargs(agent))  # TASK-029: endpoint 覆盖
         before = stats.snapshot()["llm_calls"]
         parts: list[str] = []
         try:

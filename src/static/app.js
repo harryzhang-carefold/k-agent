@@ -123,6 +123,10 @@ async function loadAgents() {
   window._skills = (await api('/api/ext/skills').catch(() => ({ skills: [] }))).skills;
   window._mcps = (await api('/api/ext/mcp').catch(() => ({ mcp_servers: [] }))).mcp_servers;
   window._kbs = (await api('/api/rag/knowledge').catch(() => ({ knowledge: [] }))).knowledge;
+  // TASK-029: 模型下拉 = 已启用 endpoint（value 存 endpoint name；
+  // 旧 agent 的自由文本模型匹配不到时显示"（自定义/默认）"，不报错）
+  window._endpoints = (await api('/api/llm-endpoints').catch(() => ({ endpoints: [] }))).endpoints
+    .filter(e => e.is_active);
   $('#page-agents').innerHTML =
     '<h2>Agent 构建器</h2><div class="panel" id="agent-form"></div>' +
     '<h3>Agent 列表（' + agentsCache.length + '）</h3>' +
@@ -141,15 +145,32 @@ async function loadAgents() {
 function hasB(a, type, ref) { return (a.bindings||[]).some(b => b.type===type && String(b.ref_id)===String(ref)); }
 function renderAgentForm(a) {
   const skills = (window._skills || []), mcps = (window._mcps || []), kb = (window._kbs || []);
+  const eps = window._endpoints || [];
   const sel = (v, arr, type, id) => arr.map(s =>
     '<option value="' + type + ':' + s.id + '"' + (a && hasB(a, type, s.id) ? ' selected' : '') + '>' + esc(s.name) + '</option>').join('');
+  // TASK-029: 模型下拉（选项 = enabled endpoints，显示 name → model）。
+  // 旧 agent 的 model 是自由文本，匹配不到 endpoint 时显示"（自定义/默认）"占位项
+  // （value 保留原值，保存不改动）；新建 agent 默认选 system-default。
+  // 注意：占位项与 system-default 不能同时 selected（浏览器取最后一个 selected，
+  // 会静默把旧值改成 system-default）。
+  const curModel = a ? (a.model || '') : '';
+  const legacyUnmatched = !!a && !!curModel && !eps.some(e => e.name === curModel);
+  const modelSel =
+    (legacyUnmatched
+      ? '<option value="' + esc(curModel) + '" selected>（自定义/默认）' + esc(curModel) + '</option>'
+      : '') +
+    eps.map(e =>
+      '<option value="' + esc(e.name) + '"' +
+      ((a && e.name === curModel) || (!a && e.name === 'system-default') ? ' selected' : '') + '>' +
+      esc(e.name) + ' → ' + esc(e.model) + '</option>').join('');
   $('#agent-form').innerHTML =
     '<div class="row">' +
     '<div><label>名称</label><input id="ag-name" value="' + (a?esc(a.name):'') + '"></div>' +
     '<div><label>描述</label><input id="ag-desc" value="' + (a?esc(a.description||''):
       '') + '"></div>' +
-    '<div><label>模型</label><input id="ag-model" value="' + (a?esc(a.model||''):'') +
-      '" placeholder="vllm-qwen3.8-27b"></div></div>' +
+    '<div><label>模型（endpoint 下拉）</label><select id="ag-model">' + modelSel + '</select>' +
+    '<div class="k">选中 endpoint 后，对话走该 endpoint 的 base_url/api_key；' +
+    '匹配不到时回退系统默认（不报错）。</div></div></div>' +
     '<label>system_prompt</label>' +
     '<textarea id="ag-sys" rows="4">' + (a?esc(a.system_prompt):'你是一名医疗助手。') + '</textarea>' +
     '<div class="row">' +

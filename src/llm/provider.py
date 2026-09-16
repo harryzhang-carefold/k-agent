@@ -31,14 +31,29 @@ def _payload(messages, stream=False, **params):
     return p
 
 
+# TASK-029 / 需求1: 按 endpoint 覆盖的可选参数。chat()/chat_stream() 额外接受
+# base_url / api_key / timeout（None = 读 S.* 默认值，向后兼容——不绑 endpoint
+# 的 agent 行为不变，RISK-018）。retries 保持 S.LLM_RETRIES（端点级重试数
+# 目前不单独暴露，避免过度设计）。
+def _endpoint_override(params: dict) -> tuple[str | None, str | None, float | None]:
+    """从 **params 提取并移除 endpoint 覆盖，返回 (base_url, api_key, timeout)。"""
+    base = params.pop("base_url", None)
+    key = params.pop("api_key", None)
+    timeout = params.pop("timeout", None)
+    return base, key, timeout
+
+
 async def chat(messages, **params) -> str:
     """Non-streaming chat. Raises LLMError after retries (controlled degradation)."""
-    url = S.LLM_BASE_URL.rstrip("/") + "/chat/completions"
+    base, key, timeout = _endpoint_override(params)
+    url = (base or S.LLM_BASE_URL).rstrip("/") + "/chat/completions"
+    key = key if key is not None else S.LLM_API_KEY
+    timeout = timeout if timeout is not None else S.LLM_TIMEOUT
     payload = _payload(messages, **params)
     last_err = None
     for attempt in range(S.LLM_RETRIES):
         try:
-            r = await _post(url, payload, S.LLM_TIMEOUT, S.LLM_API_KEY)
+            r = await _post(url, payload, timeout, key)
             if r.status_code == 401:
                 stats.bump("llm_errors")
                 raise LLMError(f"LLM 401 认证失败: {r.text[:200]}")
@@ -63,13 +78,16 @@ async def chat(messages, **params) -> str:
 
 async def chat_stream(messages, **params):
     """Streaming chat (SSE). Yields token text chunks. Raises LLMError on failure."""
-    url = S.LLM_BASE_URL.rstrip("/") + "/chat/completions"
+    base, key, timeout = _endpoint_override(params)
+    url = (base or S.LLM_BASE_URL).rstrip("/") + "/chat/completions"
+    key = key if key is not None else S.LLM_API_KEY
+    timeout = timeout if timeout is not None else S.LLM_TIMEOUT
     payload = _payload(messages, stream=True, **params)
     headers = {"Content-Type": "application/json"}
-    if S.LLM_API_KEY:
-        headers["Authorization"] = f"Bearer {S.LLM_API_KEY}"
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
     try:
-        async with httpx.AsyncClient(timeout=S.LLM_TIMEOUT) as client:
+        async with httpx.AsyncClient(timeout=timeout) as client:
             async with client.stream("POST", url, json=payload, headers=headers) as r:
                 if r.status_code == 401:
                     stats.bump("llm_errors")

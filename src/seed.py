@@ -31,6 +31,27 @@ SEED_SKILLS = [
 
 async def seed(conn):
     from core import db
+    # ---- LLM endpoint 兜底（TASK-029 / 需求1）----
+    # 系统默认 endpoint：固定名 system-default，启动时幂等 seed 一条
+    # 快照 S.LLM_* 单值（此时 S 已含 settings 表热更值，DB>.env），
+    # is_active=1 作 Agent 模型下拉的兜底/默认项。禁止从 API 删除（409）。
+    r = await db.fetchone(conn, "SELECT id FROM llm_endpoints WHERE name='system-default'")
+    if not r:
+        await db.execute(
+            conn,
+            """INSERT OR IGNORE INTO llm_endpoints
+               (name, base_url, model, api_key, timeout, retries, is_active)
+               VALUES (?,?,?,?,?,?,1)""",
+            ("system-default", S.LLM_BASE_URL, S.LLM_MODEL, S.LLM_API_KEY,
+             S.LLM_TIMEOUT, S.LLM_RETRIES))
+    # 自愈：若 S.LLM_API_KEY 后来被配置（settings 热更/重启注入），
+    # system-default 行的空 key 补为共享 key（与 S.* 快照保持一致）
+    else:
+        row = await db.fetchone(conn, "SELECT api_key FROM llm_endpoints WHERE name='system-default'")
+        if row and not row.get("api_key") and S.LLM_API_KEY:
+            await db.execute(conn, "UPDATE llm_endpoints SET api_key=? WHERE name='system-default'",
+                             (S.LLM_API_KEY,))
+
     # ---- 角色 / 权限 ----
     for code, desc in PERMISSIONS:
         await db.execute(conn, "INSERT OR IGNORE INTO permissions (code, description) VALUES (?,?)",

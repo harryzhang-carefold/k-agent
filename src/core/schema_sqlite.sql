@@ -134,6 +134,22 @@ CREATE TABLE IF NOT EXISTS roles (
   description TEXT
 );
 
+-- LLM endpoint 多维护（TASK-029 / 需求1）：可配置多个 OpenAI 兼容端点，
+-- Agent 按 name 绑定（agents.model 存 endpoint name）。api_key 写库但 API 永不回明文。
+-- 启动时 seed 一条固定名 system-default（快照 S.LLM_*，is_active=1）作兜底/默认。
+CREATE TABLE IF NOT EXISTS llm_endpoints (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT UNIQUE NOT NULL,
+  base_url TEXT NOT NULL,
+  model TEXT NOT NULL,
+  api_key TEXT DEFAULT '',
+  timeout REAL DEFAULT 90,
+  retries INTEGER DEFAULT 3,
+  is_active INTEGER DEFAULT 0,
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now'))
+);
+
 -- 系统配置持久化（TASK-021 / F3）：key 限 9 项白名单（见 core.app SETTING_KEYS），
 -- value 为 JSON 标量字符串，updated_at 记录最近一次写入。
 CREATE TABLE IF NOT EXISTS settings (
