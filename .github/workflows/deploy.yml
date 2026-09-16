@@ -34,7 +34,7 @@ jobs:
             git reset --hard origin/main
 
             # 写入生产环境环境变量
-            echo "${{ secrets.ENV_FILE }}" > .env
+            echo "${{ secrets.ENV_FILE }}" > src/.env
 
             # 构建并重新启动容器
             docker compose down --remove-orphans
