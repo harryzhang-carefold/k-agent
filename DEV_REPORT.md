@@ -969,3 +969,65 @@ const list = $('#sk-list'); if (list) list.innerHTML = _skillListHTML(canManage(
 | `shots/02_stable_after_2_5s.png` / `shots/03_list_after_upload.png` | 稳定性 + 列表刷新截图 |
 | `files/` | 4 个混合测试文件 |
 | `clean_pg_t026.py` | PG 共享 schema 自测行清理脚本（凭据走容器内 .env，不上命令行） |
+
+# T-AGP-COMPOSE-REPLACE 交付记录：`docker compose up -d` 部署时自动替换已存在容器（deploy.sh + README + 线上平滑替换验证）（2026-09-16，章北海，t_739d53cc）
+
+## 1. 背景与目标
+线上 agp-app 是手工 `docker run` 创建（`agp-platform:1.2.0-dual`，**不带 compose 标签**），执行 `docker compose up -d` 时遇已存在容器会报 `conflict: Name "agp-app" is already in use`。用户要求：**一条命令即可完成部署**——自动停止并删除已存在的同名/同项目容器（含 docker run 手工创建的无标签旧容器、compose 遗留容器、Stopped 状态），再创建启动新容器；数据在卷/PG 中，重建不丢。
+
+## 2. 改动清单（`02-development/`，git 可查）
+| 文件 | 改动 |
+|---|---|
+| `deploy.sh`（新增，可执行） | 一键部署脚本，见下 |
+| `README.md` | §4 部署与启动：方式 A 改为推荐 `./deploy.sh`（说明自动替换+数据不丢+模式选择+RISK-015），保留裸 `docker compose up -d` 用法及其 conflict 提示 |
+| compose 文件 | **零改动**（`container_name: agp-app` 保留；替换逻辑全部在脚本层，符合任务书） |
+| `src/` 业务代码 | **零改动**（本任务仅部署脚本 + 文档） |
+
+**deploy.sh 设计**（`set -euo pipefail`，日志前缀 `[deploy]`，调用方自带 docker 组权限）：
+1. **模式选择**：`./deploy.sh`（auto：`.env` 为 `DB_BACKEND=postgres` 自动叠加 `docker-compose.pg.yml`，否则纯 sqlite）/ `./deploy.sh pg` / `./deploy.sh sqlite`。
+2. **PG 模式预检（只读+建网络，RISK-015 合规）**：检查宿主 `pg-unified` 存在、`agp_default` 网络存在且 pg-unified 挂载其中；缺失时打印**明确手工指引**（`docker network connect agp_default pg-unified`）而非静默失败——脚本绝不代改别的项目容器。
+3. **容器检测与替换**：不用 `docker compose ps -q`（表头 "CONTAINER" 会被误当 ID）；直接 `docker ps -aq` 双过滤（`label=com.docker.compose.project=agp` ∪ `name=^agp-app$`，天然覆盖手工 docker run / compose 两种来源、含 Stopped）→ 统一解析为完整容器 ID 后 `sort -u` 去重 → `docker stop -t 10`（等优雅退出）→ `docker rm -f`。
+4. `docker compose [ -f ... ] up -d --build` 创建启动新容器。
+5. 健康检查 `curl http://localhost:8099/healthz`（重试 ≤30s），通过后打印最终状态（`docker compose ps` + compose 项目标签 + 健康状态 + 数据源）。失败时打印日志查看命令 + 回滚指引（旧镜像保留本地）。
+
+## 3. 线上验证（VM 192.168.48.134，真实执行，证据 `05-temp/t_739d53cc/`）
+共 6 轮 `./deploy.sh` 真实替换（前 5 轮为首个运行，第 6 轮为 PG 显式模式；另加本次复核轮，见 `final_check/`）：
+
+| 场景 | 结果 | 证据 |
+|---|---|---|
+| ① 线上 docker run 无标签 1.2.0 运行中 → `./deploy.sh` | 旧容器 stop+rm，新容器 compose 创建并 healthy；**新容器带 compose 标签**（`com.docker.compose.project=agp`） | `deploy1_run.log` + `labels_before/after.txt` |
+| ② 重复执行（旧容器已带 compose 标签） | 平滑替换，无 name conflict | `deploy2~4_run.log` |
+| ③ 无容器首启（全删后） | 正常首启 healthy | `deploy5_run.log` |
+| ④ `./deploy.sh pg` 显式 PG 模式 | 预检通过（agp_default 存在且 pg-unified 已挂载）→ 正常替换 | `deploy6_run.log` |
+| ⑤ 数据不丢 | 部署前后 `GET /api/system/config` 完全一致；pg-unified `agp` schema 21 表行数前后一致（total_rows=169，messages=86/conversations=33/memory_l2_nodes=8 等逐表一致） | `config_before/after.json`、`pg_tables_before/after.txt`、`pg_total_*.txt` |
+| ⑥ 回归 | 部署后 `http://127.0.0.1:8081/agent/` = 200（gw-nginx 未受影响） | `gateway_before/after.txt` |
+
+**本次复核轮（final_check/，验证去重修复后的脚本）**：
+- 部署前容器 `bf7f3fbe3395`（healthy, compose=agp）→ 部署后新容器 `0fa0d16ad037`（healthy, compose=agp），单容器条目（无重复 stop/rm）
+- `agp` schema 行数前后一致：messages=984 / conversations=389 / memory_l2_nodes=63（注意：与 9/16 早间 169 行基线不同——期间 TASK-027 等回归已写入新业务数据，属正常增长；**本部署前后一致**即数据不丢）
+- healthz 前后一致（除实时 counters：graph_nodes=63/edges=37、db=postgres/pg-unified/agp）
+- 网关 8081/agent/ = 200
+
+**已知小瑕疵（已修复）**：首版脚本的 name/label 双过滤对同一容器各出一条（name 过滤给短 ID、label 过滤给长 ID），导致同一容器被 stop/rm 两遍（第二遍 `docker rm` 报 no such container，被 `|| true` 吞掉，无副作用但日志噪音）。已改为**统一解析完整 ID 后去重**，复核轮日志确认单条目。
+
+## 4. 提交
+- 分支 `main`，commit 见 metadata；`deploy.sh` + `README.md` + `DEV_REPORT.md`；工作树 clean。
+
+## 5. 部署说明（当前线上状态）
+- agp-app 现为 **compose 管理**（project=agp，config_files=base+pg 叠加），镜像 `agp-platform:1.2.0-dual`，PG 模式（pg-unified/agp schema），`0.0.0.0:8099`，healthy。
+- **未动** gw-nginx / pg-unified / 哮喘系（astm-backend / astm-mariadb）；8081 网关回归 200。
+- 后续更新部署入口统一为 `sg docker -c 'cd 02-development && ./deploy.sh'`（auto 模式按 .env 自动选后端）。
+- SERVER_REGISTRY.md 已登记本次变更（2026-09-16 行 + agp-app 容器管理方式更新）。
+
+## 6. 自测证据索引（`05-temp/t_739d53cc/`）
+| 文件 | 内容 |
+|---|---|
+| `deploy1~6_run.log` | 6 轮真实部署完整日志（无标签替换/带标签替换×3/首启/PG 显式） |
+| `labels_before/after.txt` | 容器 compose 标签前后对照（无标签 → project=agp） |
+| `config_before/after.json` | `/api/system/config` 前后一致（数据不丢，脱敏字段） |
+| `healthz_before/after.json` | healthz 全字段前后对照 |
+| `pg_tables_before/after.txt` / `pg_total_*.txt` | agp schema 21 表行数逐表一致（total=169） |
+| `gateway_before/after.txt` | 8081 网关前后均 200 |
+| `final_check/` | 复核轮（去重修复后）：healthz/rows/container 前后 + `deploy_final_run.log` |
+| `capture.py` | 证据采集脚本（可复跑） |
+| `probe/compose-probe.yml` | 网络兼容探测（agp 项目名 + 宿主已有 agp_default 网络的行为验证，容器 agp-probe-app 已清理） |

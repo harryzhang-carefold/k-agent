@@ -177,7 +177,7 @@ tests/           pytest 套件（auth/agents/chat/rag/memory/mcp/longtext/ws）
 
 前置：一个可达的 OpenAI 兼容 LLM 端点。**默认 SQLite 模式无需任何数据库外部依赖**；仅 PG 模式需要一个 PostgreSQL（独立 `pg-unified` 容器，需已建 `agp` schema 与 `agp_user` 用户；参考 postgres-unified 项目的 docker-compose）。
 
-### 方式 A：Docker Compose（推荐，默认 SQLite 零依赖）
+### 方式 A：一键部署脚本 `./deploy.sh`（推荐）
 
 ```bash
 cd 02-development
@@ -185,23 +185,33 @@ cd 02-development
 # 1. 配置密钥（只需 LLM key + JWT，无需数据库密码）
 cp src/.env.example src/.env
 #    填写 AI_MODEL_API_KEY / JWT_SECRET(>=32字节) / SEED_PASSWORD
+#    （PG 模式另填 DB_BACKEND=postgres + AGP_DB_PASSWORD 等 DB_*）
 
-# 2. 构建并启动（sqlite 模式无需任何外部网络）
-docker compose up -d --build
-
-# 3. 验证
-curl http://localhost:8099/healthz      # db.backend=sqlite
-open  http://localhost:8099/            # 前端 SPA，admin / <SEED_PASSWORD> 登录
+# 2. 一键部署（一条命令完成）
+sg docker -c 'cd 02-development && ./deploy.sh'
 ```
 
-**切换为 PostgreSQL 模式**：
+`deploy.sh` 的行为（全程 `[deploy]` 日志前缀）：
+
+1. **自动替换已存在容器**：先停止并删除已存在的 `agp-app`（兼容两种来源——手工 `docker run` 创建、无 compose 标签的旧容器，以及 compose 项目 `agp` 的遗留容器，含 Stopped 状态），再 `docker compose up -d --build` 创建启动新容器。**数据在卷（`./src/data/agp.db`）/ pg-unified 的 `agp` schema 中，重建不会丢失。**
+2. 模式选择：`./deploy.sh`（默认 auto：`.env` 为 `DB_BACKEND=postgres` 时自动叠加 `docker-compose.pg.yml`，否则纯 sqlite）/ `./deploy.sh pg`（显式 PG 模式，先做 pg-unified + `agp_default` 网络预检，缺失时打印明确指引而非静默失败）/ `./deploy.sh sqlite`（纯 SQLite）。
+3. 健康检查（`/healthz`，重试 ≤30s）+ 打印最终状态（`docker compose ps`、compose 标签、健康状态、数据源）。
+
+铁律（RISK-015）：脚本只操作 `container_name=agp-app` 与 compose 项目 `agp` 的容器，绝不触碰 pg-unified / gw-nginx 等别的项目容器。
+
+**裸 `docker compose up -d` 用法（仍可用，但不含自动替换）**：
+
 ```bash
-# 1. .env 改为 DB_BACKEND=postgres 并填 AGP_DB_PASSWORD（来源 postgres-unified 项目 .env）
-# 2. 确保外部网络存在（首次）
-sg docker -c 'docker network inspect agp_default >/dev/null 2>&1 || docker network create agp_default'
-#    （若 pg-unified 未建，先拉起: cd ../postgres-unified && docker compose up -d）
-# 3. 叠加 PG 网络配置启动
-docker compose -f docker-compose.yml -f docker-compose.pg.yml up -d --build
+docker compose up -d --build                        # sqlite 模式
+docker compose -f docker-compose.yml -f docker-compose.pg.yml up -d --build   # PG 模式
+```
+
+注意：若线上已有同名 `agp-app` 容器（尤其是手工 `docker run` 创建、无 compose 标签的旧容器），裸 `up -d` 会报 `Name "agp-app" is already in use`——此时请改用 `./deploy.sh`，或先手工 `docker stop agp-app && docker rm -f agp-app` 再 `up -d`。
+
+**验证**（两种方式通用）：
+```bash
+curl http://localhost:8099/healthz      # db.backend=sqlite 或 postgres
+open  http://localhost:8099/            # 前端 SPA，admin / <SEED_PASSWORD> 登录
 ```
 
 常用运维：`docker compose logs -f`、`docker compose ps`、`docker compose down`（保留卷数据）。
