@@ -8,6 +8,17 @@ let me = null;
 let agentsCache = [];
 let curAgent = null;
 let curConv = null;
+// TASK-038: hermes 后端状态（创建/编辑表单类型联动用）
+//  _hermesAvail: GET /api/hermes/status 探测结果（null=未探测/探测失败）
+//  _hermesProfiles: GET /api/hermes/profiles 解析出的 profile 列表
+//  _curBackend: 当前表单选中的类型（'custom' | 'hermes'），切换时保留表单值
+let _hermesAvail = null;
+let _hermesProfiles = null;
+let _curBackend = 'custom';
+// TASK-038: 表单渲染代数。loadAgents 是 fire-and-forget（goto 不 await 回调），
+// 若两次 loadAgents 在途，旧的 await 完成后会用默认表单覆盖用户已操作的表单
+// （表现为 radio 被重置 / 已填值丢失）。用代数守卫：过期的渲染直接丢弃。
+let _formGen = 0;
 
 async function api(path, opts = {}) {
   const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) }
@@ -131,20 +142,73 @@ async function loadAgents() {
   // 旧 agent 的自由文本模型匹配不到时显示"（自定义/默认）"，不报错）
   window._endpoints = (await api('/api/llm-endpoints').catch(() => ({ endpoints: [] }))).endpoints
     .filter(e => e.is_active);
+  // TASK-038: 渲染代数守卫（见 _formGen 注释）：loadAgents 是 fire-and-forget，
+  // 若两次 loadAgents 在途，旧的一次 await 完成后会用默认表单覆盖用户已操作的
+  // 表单。入口递增、探测期间若有更新的 loadAgents 进入，本次 render 直接丢弃。
+  const gen = ++_formGen;
+  // TASK-038: hermes 后端探测（AC-H7: 503/不可用 → 类型单选不显示 Hermes 选项）。
+  // 探测失败（503 或异常）均按不可用处理，不影响 custom 表单。
+  await probeHermes();
+  if (gen !== _formGen) return;  // 有更新的 loadAgents 在途 → 丢弃本次渲染
   $('#page-agents').innerHTML =
     '<h2>Agent 构建器</h2><div class="panel" id="agent-form"></div>' +
     '<h3>Agent 列表（' + agentsCache.length + '）</h3>' +
     '<table><tr><th>ID</th><th>名称</th><th>模型</th><th>参数</th><th>绑定</th><th>操作</th></tr>' +
-    agentsCache.map(a => '<tr><td>' + a.id + '</td><td>' + esc(a.name) +
+    agentsCache.map(a => {
+      // TASK-038: hermes 类型 agent 加 badge（列表标识）
+      const badge = (a.backend === 'hermes')
+        ? ' <span class="tag herm" title="Hermes Agent 后端">Hermes</span>' : '';
+      // hermes agent 无 AGP 模型（对话由 profile 自带 LLM 配置驱动），
+      // 模型列展示 profile 名；custom agent 显示原模型（零改动）
+      const modelCell = (a.backend === 'hermes')
+        ? '<span class="tag herm">' + esc(a.hermes_profile || '') + '</span>'
+        : esc(a.model || '');
+      return '<tr><td>' + a.id + '</td><td>' + esc(a.name) + badge +
       '<div class="k">' + esc(a.description||'') + '</div></td>' +
-      '<td class="mono">' + esc(a.model||'') + '</td>' +
+      '<td class="mono">' + modelCell + '</td>' +
       '<td class="k">t=' + a.temperature + ' · max=' + a.max_tokens + '</td>' +
       '<td>' + (a.bindings||[]).map(b => '<span class="tag">' + esc(b.type) + ':' + esc(b.ref_id) + '</span>').join('') + '</td>' +
       '<td><button class="small" onclick="editAgent(' + a.id + ')">编辑</button>' +
       '<button class="small" onclick="viewPrompt(' + a.id + ')">Prompt</button>' +
-      '<button class="danger" onclick="delAgent(' + a.id + ')">删除</button></td></tr>').join('') +
+      '<button class="danger" onclick="delAgent(' + a.id + ')">删除</button></td></tr>';
+    }).join('') +
     '</table>';
   renderAgentForm(null);
+}
+// TASK-038: 探测 hermes CLI 是否可用（GET /api/hermes/status）。
+// 该端点仅要求登录（无额外权限码）；503/异常 → 不可用（AC-H7 优雅降级）。
+async function probeHermes() {
+  try {
+    const r = await fetch(_agentApiPath('/api/hermes/status'), {
+      headers: authHeaders() });
+    if (r.status === 401) { doLogout(); throw new Error('未认证'); }
+    const j = await r.json().catch(() => ({}));
+    _hermesAvail = !!(r.ok && j && j.available === true);
+  } catch {
+    _hermesAvail = false;
+  }
+  // 不可用时不加载 profile（任务书 §4.5 第4条）。
+  // 必须 await：renderAgentForm 在 probeHermes 返回后才执行，
+  // 不 await 会导致 profile 下拉先渲染为空、之后不再刷新。
+  if (_hermesAvail) await loadHermesProfiles();
+  else _hermesProfiles = [];
+}
+function _agentApiPath(path) {
+  // 子目录部署适配（与 api() 同逻辑）
+  const m = location.pathname.match(/^(.*\/)agent\//);
+  return m ? m[1] + 'agent' + path : path;
+}
+function authHeaders() {
+  const t = localStorage.getItem(TOKEN_KEY);
+  return { 'Authorization': t ? 'Bearer ' + t : '' };
+}
+async function loadHermesProfiles() {
+  try {
+    const j = await api('/api/hermes/profiles');
+    _hermesProfiles = j.profiles || [];
+  } catch {
+    _hermesProfiles = [];
+  }
 }
 function hasB(a, type, ref) { return (a.bindings||[]).some(b => b.type===type && String(b.ref_id)===String(ref)); }
 function renderAgentForm(a) {
@@ -170,11 +234,56 @@ function renderAgentForm(a) {
       '<option value="' + esc(e.name) + '"' +
       ((a && e.name === curModel) || (!a && e.name === 'system-default') ? ' selected' : '') + '>' +
       esc(e.name) + ' → ' + esc(e.model) + '</option>').join('');
-  $('#agent-form').innerHTML =
+
+  // ---- TASK-038: 类型联动（§4.5）----
+  // 编辑 hermes agent → 回显 backend=hermes + hermes_profile（§4.5 第1条）
+  const isHermesEdit = !!(a && a.backend === 'hermes');
+  _curBackend = isHermesEdit ? 'hermes' : 'custom';
+  // AC-H7: hermes 不可用时（探测 503/失败）不显示 Hermes Agent 选项
+  const hermesOption = _hermesAvail
+    ? '<label class="backend-opt"><input type="radio" name="ag-backend" value="hermes"' +
+      (_curBackend === 'hermes' ? ' checked' : '') + '> Hermes Agent</label>'
+    : '';
+  const hermesUnavailableHint = !_hermesAvail
+    ? '<div class="k hermes-off">（Hermes 后端当前不可用（服务端未挂载 hermes 运行时），仅可创建自定义 Agent）</div>'
+    : '';
+
+  // hermes 区：profile 下拉（value = profile 名）+ 新建 profile 按钮 + 提示文案
+  const profiles = _hermesProfiles || [];
+  // 编辑 hermes agent 且其 profile 不在列表中（profile 已被删/改名）→
+  // 加一个 disabled 占位项回显原值（保存会被后端 400 校验拦截并提示，
+  // 用户可改选其他 profile）
+  const editProfMissing = isHermesEdit && a.hermes_profile &&
+    !profiles.some(p => p.name === a.hermes_profile);
+  const profSel =
+    (editProfMissing
+      ? '<option value="' + esc(a.hermes_profile) + '" selected disabled>' +
+        esc(a.hermes_profile) + '（profile 已不存在，请改选）</option>'
+      : '') +
+    profiles.map(p =>
+    '<option value="' + esc(p.name) + '"' +
+    ((isHermesEdit && a.hermes_profile === p.name) ? ' selected' : '') + '>' +
+    esc(p.name) + (p.model ? ' <span class="k">(' + esc(p.model) + ')</span>' : '') + '</option>').join('');
+  const hermesSection =
+    '<div id="ag-hermes-sec"' + (_curBackend === 'hermes' ? '' : ' class="hidden"') + '>' +
+    (profiles.length
+      ? ''
+      : '<div class="k" id="ag-prof-empty">当前没有可用 profile，请先"新建 profile"。</div>') +
     '<div class="row">' +
-    '<div><label>名称</label><input id="ag-name" value="' + (a?esc(a.name):'') + '"></div>' +
-    '<div><label>描述</label><input id="ag-desc" value="' + (a?esc(a.description||''):
-      '') + '"></div>' +
+    '<div><label>Hermes Profile（agent 名将与所选 profile 一致）</label>' +
+    '<select id="ag-prof" onchange="onHermesProfileChange()">' +
+    (profiles.length ? '<option value=""' +
+      ((!isHermesEdit) ? ' selected' : '') + '>— 选择 profile —</option>' : '') +
+    profSel + '</select></div>' +
+    '<div style="align-self:flex-end"><button class="small" onclick="createHermesProfile()">+ 新建 profile</button></div>' +
+    '</div><div class="k hermes-tip">Hermes Agent 默认仅对话；工具由 Hermes profile 自身 skills 决定（不注入 AGP 的 skills/mcp/rag/plugins）。' +
+    '创建时 agent 名称必须与 profile 名一致；删除 agent 不会删除 profile。</div>' +
+    '<div id="ag-prof-err" class="err"></div></div>';
+
+  // custom 区：现有表单原样（零回归）——模型下拉 + system_prompt + 参数 + 绑定
+  const customSection =
+    '<div id="ag-custom-sec"' + (_curBackend === 'custom' ? '' : ' class="hidden"') + '>' +
+    '<div class="row">' +
     '<div><label>模型（endpoint 下拉）</label><select id="ag-model">' + modelSel + '</select>' +
     '<div class="k">选中 endpoint 后，对话走该 endpoint 的 base_url/api_key；' +
     '匹配不到时回退系统默认（不报错）。</div></div></div>' +
@@ -193,17 +302,86 @@ function renderAgentForm(a) {
     '<div><label>Plugins（动态：GET /api/ext/plugins）</label><select id="ag-pl" multiple size="3">' +
     plugins.map(p => '<option value="plugin:' + esc(p) + '"' +
       (a && hasB(a, 'plugin', p) ? ' selected' : '') + '>' + esc(p) + '</option>').join('') + '</select></div></div>' +
-    '<div class="k" id="ag-bind-hint"></div>' +
+    '<div class="k" id="ag-bind-hint"></div></div>';
+
+  $('#agent-form').innerHTML =
+    '<div class="row">' +
+    '<div><label>名称</label><input id="ag-name" value="' + (a?esc(a.name):'') + '"></div>' +
+    '<div><label>描述</label><input id="ag-desc" value="' + (a?esc(a.description||''):
+      '') + '"></div></div>' +
+    '<label>类型</label><div class="backend-group">' +
+    '<label class="backend-opt"><input type="radio" name="ag-backend" value="custom"' +
+      (_curBackend === 'custom' ? ' checked' : '') + '> 自定义 Agent</label>' +
+    hermesOption + '</div>' + hermesUnavailableHint +
+    hermesSection + customSection +
     '<div style="margin-top:14px">' +
     '<button class="primary" style="width:auto;padding:10px 26px" onclick="saveAgent(' + (a?a.id:'null') + ')">' +
     (a?'保存':'创建 Agent') + '</button>' +
     (a?'<button class="small" onclick="loadAgents()">取消</button>':'') +
     ' <span id="ag-err" class="err"></span></div>';
+  // 类型单选联动：切换时显示/隐藏对应区块（不重渲染 → 保留已填值）
+  document.querySelectorAll('input[name="ag-backend"]').forEach(r => {
+    r.onchange = () => {
+      _curBackend = r.value;
+      const h = document.getElementById('ag-hermes-sec');
+      const c = document.getElementById('ag-custom-sec');
+      if (h) h.classList.toggle('hidden', _curBackend !== 'hermes');
+      if (c) c.classList.toggle('hidden', _curBackend !== 'custom');
+      if (_curBackend === 'hermes') {
+        // 切到 hermes：若尚未选 profile，自动选中第一个（无则提示先新建）
+        const prof = document.getElementById('ag-prof');
+        if (prof && !prof.value && profiles.length) prof.selectedIndex = 1;
+      }
+    };
+  });
+  // hermes 区联动：选 profile → 同步名称（§4.4: name 与 profile 一致）
+  const profEl = document.getElementById('ag-prof');
+  if (profEl) profEl.onchange = onHermesProfileChange;
   // TASK-031 打磨：四个绑定 select 任一变化 → 更新空值提示（可选提示，不阻断保存）
   ['ag-sk','ag-mc','ag-rk','ag-pl'].forEach(id => {
     const el = document.getElementById(id);
     if (el) { el.onchange = checkBindHint; checkBindHint(); }
   });
+}
+// TASK-038: 选择 hermes profile 时把名称同步为 profile 名（后端强制 name==profile）。
+// 手动改过名称后不再覆盖（以用户输入为准）。
+function onHermesProfileChange() {
+  const prof = document.getElementById('ag-prof');
+  const nameEl = document.getElementById('ag-name');
+  if (prof && prof.value && nameEl && !nameEl.value) nameEl.value = prof.value;
+}
+// TASK-038: 表单内新建 profile（POST /api/hermes/profiles）→ 刷新下拉并选中
+async function createHermesProfile() {
+  const errEl = document.getElementById('ag-prof-err');
+  if (!errEl) return;
+  const name = prompt('新 profile 名称（小写字母/数字/_/-，字母数字开头；' +
+    'agent 名称将与其一致）:');
+  if (name === null) return;
+  const n = name.trim();
+  if (!n) return;
+  const desc = prompt('描述（可选）:') || '';
+  try {
+    await api('/api/hermes/profiles', { method: 'POST',
+      body: JSON.stringify({ name: n, description: desc || null }) });
+    await loadHermesProfiles();
+    // 刷新下拉（保留已选值语义：新 profile 直接选中）
+    const profEl = document.getElementById('ag-prof');
+    if (profEl) {
+      const cur = profEl.value;
+      profEl.innerHTML = '<option value="" selected>— 选择 profile —</option>' +
+        (_hermesProfiles || []).map(p =>
+          '<option value="' + esc(p.name) + '">' + esc(p.name) +
+          (p.model ? ' <span class="k">(' + esc(p.model) + ')</span>' : '') + '</option>').join('');
+      const opt = [...profEl.options].find(o => o.value === n);
+      if (opt) opt.selected = true;
+      onHermesProfileChange();
+    }
+    errEl.textContent = '';
+    errEl.classList.remove('err');
+    errEl.className = 'ok';
+    errEl.textContent = 'profile "' + n + '" 已创建';
+    setTimeout(() => { if (errEl) { errEl.textContent = ''; errEl.className = 'err'; } }, 3000);
+  } catch (e) { errEl.textContent = e.message; }
 }
 // 空值校验（可选提示，不强制）：四个绑定都没选时给一行轻提示，选了即消失
 function checkBindHint() {
@@ -220,19 +398,37 @@ async function editAgent(id) {
   $('#agent-form').scrollIntoView({ behavior: 'smooth' });
 }
 async function saveAgent(id) {
-  const body = {
-    name: $('#ag-name').value.trim(),
-    description: $('#ag-desc').value.trim(),
-    system_prompt: $('#ag-sys').value,
-    model: $('#ag-model').value.trim() || null,
-    temperature: parseFloat($('#ag-t').value) || 0.2,
-    max_tokens: parseInt($('#ag-max').value) || 1024,
-    top_p: parseFloat($('#ag-p').value) || 0.9,
-    bindings: [...$('#ag-sk').selectedOptions, ...$('#ag-mc').selectedOptions,
-              ...$('#ag-rk').selectedOptions, ...$('#ag-pl').selectedOptions]
-      .map(o => { const [type, ref_id] = o.value.split(':'); return { type, ref_id }; }),
-  };
-  if (!body.name || !body.system_prompt) { $('#ag-err').textContent = '名称和 system_prompt 必填'; return; }
+  const name = $('#ag-name').value.trim();
+  if (!name) { $('#ag-err').textContent = '名称必填'; return; }
+  let body;
+  if (_curBackend === 'hermes') {
+    // TASK-038: hermes agent —— 后端强制 name === hermes_profile（4.1 设计）
+    const profile = $('#ag-prof').value;
+    if (!profile) { $('#ag-err').textContent = '请选择 Hermes Profile（或先新建）'; return; }
+    if (name !== profile) {
+      $('#ag-err').textContent = 'Hermes Agent 的名称必须与所选 profile 一致（当前名称 "' + name + '" ≠ "' + profile + '"）';
+      return;
+    }
+    body = { name, description: $('#ag-desc').value.trim(),
+      backend: 'hermes', hermes_profile: profile,
+      model: null, system_prompt: '' };
+  } else {
+    // custom：现有请求体原样（零回归）
+    body = {
+      name,
+      description: $('#ag-desc').value.trim(),
+      system_prompt: $('#ag-sys').value,
+      model: $('#ag-model').value.trim() || null,
+      temperature: parseFloat($('#ag-t').value) || 0.2,
+      max_tokens: parseInt($('#ag-max').value) || 1024,
+      top_p: parseFloat($('#ag-p').value) || 0.9,
+      backend: 'custom',
+      bindings: [...$('#ag-sk').selectedOptions, ...$('#ag-mc').selectedOptions,
+                ...$('#ag-rk').selectedOptions, ...$('#ag-pl').selectedOptions]
+        .map(o => { const [type, ref_id] = o.value.split(':'); return { type, ref_id }; }),
+    };
+    if (!body.system_prompt) { $('#ag-err').textContent = '名称和 system_prompt 必填'; return; }
+  }
   try {
     if (id) await api('/api/agents/' + id, { method: 'PUT', body: JSON.stringify(body) });
     else await api('/api/agents', { method: 'POST', body: JSON.stringify(body) });
@@ -241,7 +437,15 @@ async function saveAgent(id) {
   } catch (e) { $('#ag-err').textContent = e.message; }
 }
 async function delAgent(id) {
-  if (!confirm('删除该 Agent？')) return;
+  // TASK-038: 删除 hermes agent 的二次确认文案提示 profile 保留
+  // （后端默认不联动删 profile，任务书 §4.5 第3条）
+  const a = agentsCache.find(x => x.id === id);
+  const isHermes = a && a.backend === 'hermes';
+  const msg = isHermes
+    ? '删除该 Hermes Agent？\n（其 Hermes profile "' + (a.hermes_profile||'') +
+      '" 将保留，可在表单的 profile 下拉中管理/删除；此处仅删除 AGP 的 agent 记录）'
+    : '删除该 Agent？';
+  if (!confirm(msg)) return;
   try { await api('/api/agents/' + id, { method: 'DELETE' }); await loadAgents(); }
   catch (e) { alert(e.message); }
 }

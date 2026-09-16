@@ -1597,3 +1597,83 @@ DELETE FROM agp.conversations WHERE id IN ('c10bc0e23b248','caa33a8ce9d04','cdf0
 - 未 merge main、未部署（TASK-040 范围）✅
 - 临时文件全 `05-temp/t037/`，未用 /tmp ✅
 - 双后端（sqlite + PG 隔离容器）自测 ✅
+
+# TASK-038 · 阶段六前端：Agent 类型单选联动 + Hermes profile 下拉/新建 + 列表 badge + 不可用隐藏（2026-09-16，章北海，t_b870432b）
+
+分支 `feat/hermes-agent`（接 TASK-037 `268af6a`，同一分支串行），**不 merge main、不部署**（TASK-040 范围）。纯前端改动（`src/static/`），后端零改动（TASK-037 接口原样消费）。
+
+## 1. 实现说明（对照任务书 §4.5，5 条全覆盖）
+
+### 1.1 类型单选联动（§4.5 第1条）
+- `src/static/app.js` `renderAgentForm` 表单顶部加「类型」单选 `[自定义 Agent | Hermes Agent]`（原生 radio，新增 `.backend-group/.backend-opt` 样式）。
+- 选 **hermes**：显示 `#ag-hermes-sec`（profile 下拉 + 新建按钮 + 提示文案「Hermes Agent 默认仅对话；工具由 Hermes profile 自身 skills 决定（不注入 AGP 的 skills/mcp/rag/plugins）。创建时 agent 名称必须与 profile 名一致；删除 agent 不会删除 profile。」），隐藏 `#ag-custom-sec`（模型下拉/system_prompt/参数/绑定区整体进 custom 区）。
+- 选 **custom**：`#ag-custom-sec` 原样渲染（TASK-029/031 的模型下拉、四选绑定、空值提示逐行保留，**零回归**）。
+- 切换用 `classList.toggle('hidden')` 而非重渲染 → **已填值保留**（切 hermes 再切回 custom，system_prompt/名称原值不变，S1 自测覆盖）。
+- 编辑 hermes 类型 agent：`a.backend==='hermes'` → 回显 radio=hermes + profile 下拉选中 `a.hermes_profile`（S2 覆盖）；编辑 custom 不受影响（S3 覆盖）。
+- profile 已不存在（被 CLI 改名/删除）的 hermes agent 编辑回显：加 disabled 占位项「profile 已不存在，请改选」，保存会被后端 400 拦截提示（边界处理）。
+- 选 profile 时名称自动同步为 profile 名（后端 `_normalize_agent_backend` 强制 `name===hermes_profile`，否则 400）；用户手动改过名称后不再覆盖。
+
+### 1.2 profile 下拉 + 新建（§4.5 第1条）
+- profile 下拉 value = profile 名，选项显示 `name (model)`，数据源 `GET /api/hermes/profiles`（TASK-037 接口，解析 CLI list 为 JSON）。
+- 「+ 新建 profile」按钮（表单内嵌，无独立页面，任务书范围控制）→ `POST /api/hermes/profiles {name, description}` → 成功后**刷新下拉并自动选中新 profile**，同步名称；成功/失败文案显示在 `#ag-prof-err`（3s 自动消失）。
+- 无 profile 时显示「当前没有可用 profile，请先新建 profile。」引导。
+
+### 1.3 列表 badge（§4.5 第2条）
+- `loadAgents` 列表行：`a.backend==='hermes'` → 名称旁加紫色 `Hermes` badge（`.tag.herm`）；模型列显示 profile 名（hermes agent 无 AGP 模型，对话由 profile 自带 LLM 配置驱动）。custom agent 行原样（零改动）。
+
+### 1.4 删除二次确认（§4.5 第3条）
+- `delAgent`：hermes agent 的 confirm 文案为「删除该 Hermes Agent？（其 Hermes profile "X" 将保留，可在表单的 profile 下拉中管理/删除；此处仅删除 AGP 的 agent 记录）」；custom agent 保持原「删除该 Agent？」文案。后端默认不联动删 profile（TASK-037 已实现，本卡纯前端提示）。
+
+### 1.5 hermes 不可用隐藏（§4.5 第4条，AC-H7）
+- `loadAgents` 时先 `probeHermes()`：`GET /api/hermes/status`（登录即可，无权限码）→ `available===true` 才加载 profiles 并渲染 Hermes 选项。
+- 503/异常/`available:false` → 类型单选**不显示 Hermes Agent 选项**，显示灰字提示「（Hermes 后端当前不可用（服务端未挂载 hermes 运行时），仅可创建自定义 Agent）」，profile 下拉不加载（选项数为 0）。custom 表单完全不受影响。
+- 注意：`/api/hermes/status` 是**探测端点恒 200**（返回 `{available:false, message}`），503 出现在 `/api/hermes/*` 业务端点（TASK-037 设计）；前端以 `available` 字段为准。
+
+### 1.6 风格统一（§4.5 第5条）
+- 原生 CSS/JS，零依赖零构建（DECISION-001）；`src/static/style.css` 仅新增 12 行（`.backend-group/.backend-opt/.tag.herm/.hermes-off/.hermes-tip`），配色沿用既有 `--acc/--dim` 变量 + hermes 紫 `#c08bff`。
+
+## 2. 改动文件清单
+| 文件 | 改动 |
+|---|---|
+| `src/static/app.js` | +248/-22：`_hermesAvail/_hermesProfiles/_curBackend/_formGen` 状态；`loadAgents`（badge+probeHermes）；`probeHermes/_agentApiPath/authHeaders/loadHermesProfiles`（新增）；`renderAgentForm`（类型单选+hermes/custom 双区+回显）；`onHermesProfileChange/createHermesProfile`（新增）；`saveAgent`（hermes/custom 分支请求体）；`delAgent`（hermes 确认文案） |
+| `src/static/style.css` | +12：类型单选组/Hermes 徽章/提示文案样式 |
+| `README.md` | 功能表加「Hermes 前端联动（阶段六）」行 |
+| `DEV_REPORT.md` | 本节 |
+
+后端（`src/routers/*`、`src/core/*`、`src/engine/*`、`src/Dockerfile`、`docker-compose.yml`）**零改动**——diff 仅 `src/static/` + 文档。
+
+## 3. 自测（RISK-015 隔离容器，证据 `05-temp/t038/`）
+
+### 3.1 环境
+- `t038-ui`（8700）：`agp-platform:t038`（含本卡前端，自 `src/Dockerfile` 构建）+ 隔离数据卷 `05-temp/t038/data` + 挂宿主 `~/.hermes` + `~/.local/share/uv`（hermes CLI 可用，与 t037-sqlite 同构）。
+- `t038-nohermes`（8701）：同镜像但**不挂** `~/.hermes`/`uv` → `hermes_available()=False`（AC-H7 路径；S4 专用）。
+- 均 `docker run` 隔离，未动 8099 线上、未起项目 compose。
+
+### 3.2 Playwright 自测结果：38/38 PASS（`test_ui.py` + `test_ui.log`）
+| 场景 | 断言 | 结果 |
+|---|---|---|
+| S1 类型切换联动 | 默认 custom；切 hermes→custom 区隐藏/hermes 区显示/下拉+新建按钮+提示文案；切回 custom→原值保留（system_prompt/名称） | 11 PASS |
+| S2 hermes 创建全流程 | 建 profile→下拉刷新选中→名称同步→创建 agent→**列表行+紫色 Hermes badge+模型列 profile 名+DB backend=hermes**→编辑回显（radio/profile/custom 区隐藏）→删除二次确认含「将保留」→取消后 agent 仍在 | 11 PASS |
+| S3 custom 零回归 | 模型下拉非空+默认 system-default；创建→**DB backend=custom**+无 badge；编辑回显（radio/system_prompt/skill 绑定/custom 区显示）；再保存温度 t=0.5 落库 | 10 PASS |
+| S4 503 隐藏（t038-nohermes） | 类型单选无 Hermes 选项；不可用提示文案；profile 下拉不加载（0 选项）；custom 表单可用；API：`/status` `available:false` + `/profiles` 503 | 6 PASS |
+
+截图（`05-temp/t038/*.png`，vision 核对）：`s1_hermes_view.png`（hermes 区：下拉+新建+提示，custom 区隐藏）、`s2_badge.png`（列表 Hermes 徽章+模型列 profile 名）、`s2_edit_hermes.png`（编辑回显）、`s2_confirm_dialog.png`（删除确认文案）、`s3_custom_created.png`/`s3_custom_edited.png`（custom 零回归）、`s4_nohermes_hidden.png`（不可用隐藏）。
+
+### 3.3 已知问题/说明
+1. **`saveAgent` 保存后调 `loadAgents()` 重渲染表单**（既有行为，1.3.0 同款）→「已保存」文案随重渲染短暂消失；属既有 UX 非本卡引入，零回归保留，未改（改动会扩大 diff 风险）。测试断言以「列表行出现 + DB backend」为成功信号，不依赖该文案。
+2. `probeHermes` 未 await `loadHermesProfiles()` 会导致 profile 下拉渲染为空且不再刷新——**已修复**（`await loadHermesProfiles()`，S2 覆盖）。
+3. 两次在途 `loadAgents`（fire-and-forget 导航）可能旧渲染覆盖用户已操作的表单——已加 `_formGen` 代数守卫（探测期间过期的渲染丢弃）。
+4. `/api/hermes/status` 恒 200（探测端点语义，TASK-037 定义）；503 在业务端点。前端以 `available` 字段判断，与 TASK-037 AC-H7「status 探测端点」一致。
+
+## 4. 部署
+- 前端为静态文件，随 `src/Dockerfile` `COPY . .` 进镜像；**本卡不构建正式镜像、不部署**（TASK-040 两步切换 1.4.0 时 `docker compose up -d --build` 自动带上）。
+- 自测镜像 `agp-platform:t038` 为临时验证镜像（05-temp 环境），非交付物；交付走 TASK-040 的 `agp-platform:1.4.0`。
+- 无需新增端口/卷/台账变更（纯前端，复用 TASK-037 的 HERMES_HOME 挂载与 8099 端口）。
+
+## 5. 铁律核对
+- RISK-015：自测容器 `t038-ui`/`t038-nohermes` 均 docker run 隔离，未动 8099 线上/项目 compose ✅
+- DECISION-001：纯原生 JS/CSS，无构建步骤、无新依赖 ✅
+- 零回归：custom 表单（TASK-029~031 成果）逐行保留，S3 10 项断言覆盖 ✅
+- 范围控制：不做 profile 独立管理页（表单内嵌下拉+新建）、不做 hermes agent 工具注入（任务书 §六）✅
+- 不 merge main、不部署 ✅
+- 临时文件全 `05-temp/t038/`，未用 /tmp ✅

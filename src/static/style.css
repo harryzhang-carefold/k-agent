@@ -67,6 +67,18 @@ pre { background:#0b0f18; border:1px solid #26314d; border-radius:8px; padding:1
 .tag.acc { color:var(--acc); border-color:var(--acc); }
 .tag.ok { color:var(--ok); border-color:var(--ok); }
 .tag.warn { color:var(--warn); border-color:var(--warn); }
+/* TASK-038: hermes 后端 — 类型单选组 / Hermes 徽章 / 提示文案 */
+.backend-group { display:flex; gap:18px; margin:6px 0 10px; }
+.backend-opt { display:inline-flex; align-items:center; gap:6px; font-size:14px;
+  cursor:pointer; padding:6px 12px; border:1px solid #2c3a5e; border-radius:8px;
+  background:var(--panel2); }
+.backend-opt:has(input:checked) { border-color:var(--acc); color:var(--acc);
+  background:rgba(79,140,255,.08); }
+.backend-opt input { margin:0; }
+.tag.herm { color:#c08bff; border-color:#c08bff; }
+.hermes-off { color:var(--dim); }
+.hermes-tip { color:var(--dim); border-left:3px solid #c08bff;
+  padding:6px 10px; margin:8px 0; background:rgba(192,139,255,.06); }
 /* 对话 */
 .chat-box { display:flex; flex-direction:column; height:calc(100vh - 190px); }
 .chat-msgs { flex:1; overflow-y:auto; padding:6px 4px; }

@@ -21,6 +21,7 @@
 | **MCP / 长文本 tooltip（阶段五）** | MCP 配置 + 长文本 4 策略信息 tooltip（纯 CSS hover 原生实现），文案与 `mcp_server_demo.py` 实际参数 / `longtext.py` docstring 逐条核对，窄屏不遮挡 |
 | **Agent 绑定端到端（阶段五）** | Skill/MCP/RAG/**Plugins（动态下拉 GET /api/ext/plugins）** 四选绑定，保存落库 + Prompt 预览体现生效（工具 schema 注入） |
 | **Hermes Agent 双后端（阶段六）** | Agent 可选 `custom`（内置引擎，零回归）/ `hermes`（hermes CLI profile 后端）：`/api/hermes/profiles` CRUD + `/status` 探测（CLI 缺失优雅 503）；hermes 对话=同步 `hermes -p <profile> -z` + WS 流式（整段 token）+ L0 记忆照写 + 受控降级（不裸 500）；profile 创建即零工具面（仅对话）；api_key 全程脱敏（AC-H9）；双后端（sqlite/PG）幂等迁移 |
+| **Hermes 前端联动（阶段六）** | Agent 表单顶部类型单选 `[自定义 Agent \| Hermes Agent]`（hermes 不可用时选项隐藏+提示，AC-H7）；选 hermes → profile 下拉（`GET /api/hermes/profiles`，含「+ 新建 profile」内嵌创建并自动选中）+ 提示文案（默认仅对话/工具由 profile skills 决定），隐藏 system_prompt/模型/绑定区；选 custom → 原表单零回归；列表 hermes agent 加紫色 `Hermes` badge（模型列显示 profile 名）；删除 hermes agent 二次确认提示 profile 保留 |
 | **API 与前端** | REST `/api/*` + WebSocket `/ws/chat/{agent}/{conv}`（流式）；纯原生 JS SPA（无框架） |
 | **可观测** | `/healthz` 健康检查（含 LLM/embedding/DB/记忆后端状态） |
 
