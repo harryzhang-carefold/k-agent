@@ -1,0 +1,41 @@
+name: Deploy to GCP VM
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Deploy to GCP VM via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+            DEPLOY_DIR="/home/partners"
+
+            if [ ! -d "$DEPLOY_DIR/.git" ]; then
+              echo "Cloning repository..."
+              git clone https://github.com/${{ github.repository }}.git $DEPLOY_DIR
+            fi
+
+            cd $DEPLOY_DIR
+            echo "Pulling latest changes..."
+            git fetch origin main
+            git reset --hard origin/main
+
+            # 写入生产环境环境变量
+            echo "${{ secrets.ENV_FILE }}" > .env
+
+            # 构建并重新启动容器
+            docker compose down --remove-orphans
+            docker compose up -d --build
