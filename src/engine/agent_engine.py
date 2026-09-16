@@ -234,9 +234,17 @@ class AgentEngine:
                          on_token=None) -> str:
         args = {"temperature": agent["temperature"], "max_tokens": agent["max_tokens"],
                 "top_p": agent["top_p"]}
-        if agent.get("model"):
-            args["model"] = agent["model"]
-        args.update(await self._endpoint_kwargs(agent))  # TASK-029: endpoint 覆盖
+        # TASK-029: endpoint 覆盖 + BUG-007 回退（同步路径）。
+        # 仅当 agent.model 能解析为"可用 endpoint 行"（含 base_url）时，才用
+        # 端点行覆盖 base_url/api_key/timeout/model；解析失败（查不到/停用/
+        # 已删/表异常）时，payload model 不得停在 endpoint **name**（对 LLM
+        # 无意义 → 默认端点 404 model does not exist → 降级），而是回退
+        # S.LLM_MODEL 走系统默认端点（RISK-018 兜底不变式，TASK-034）。
+        _epk = await self._endpoint_kwargs(agent)
+        if _epk:
+            args.update(_epk)
+        elif agent.get("model"):
+            args["model"] = S.LLM_MODEL
         content = ""
         for _round in range(S.MAX_TOOL_ROUNDS):
             content = await llm.chat(messages, **args)
@@ -295,9 +303,15 @@ class AgentEngine:
             return out
         args = {"temperature": agent["temperature"], "max_tokens": agent["max_tokens"],
                 "top_p": agent["top_p"]}
-        if agent.get("model"):
-            args["model"] = agent["model"]
-        args.update(await self._endpoint_kwargs(agent))  # TASK-029: endpoint 覆盖
+        # TASK-029: endpoint 覆盖 + BUG-007 回退（流式路径）。
+        # 与 _tool_loop 同一逻辑：endpoint 解析成功（含 base_url）才覆盖；
+        # 解析失败时 model 回退 S.LLM_MODEL，不得停在 endpoint name
+        # （否则默认端点 404 → degraded，违反 RISK-018 兜底，TASK-034）。
+        _epk = await self._endpoint_kwargs(agent)
+        if _epk:
+            args.update(_epk)
+        elif agent.get("model"):
+            args["model"] = S.LLM_MODEL
         before = stats.snapshot()["llm_calls"]
         parts: list[str] = []
         try:
