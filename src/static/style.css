@@ -101,3 +101,25 @@ pre { background:#0b0f18; border:1px solid #26314d; border-radius:8px; padding:1
 .bt-idx { flex:0 0 26px; text-align:center; color:var(--dim); background:var(--panel2);
   border:1px solid #2c3a5e; border-radius:6px; padding:1px 4px; }
 .bt-rec { font-family:ui-monospace,Menlo,Consolas,monospace; word-break:break-all; color:var(--fg); }
+/* TASK-030: info tooltip（MCP 配置 / 长文本 4 策略） */
+.tip-wrap { position:relative; display:inline-flex; vertical-align:middle; margin-left:6px; }
+.tip-icon {
+  display:inline-flex; align-items:center; justify-content:center;
+  width:16px; height:16px; border-radius:50%;
+  background:var(--panel2); border:1px solid var(--acc);
+  color:var(--acc); font-size:11px; font-weight:700; font-style:italic;
+  cursor:help; user-select:none; line-height:1;
+}
+.tip-box {
+  display:none; position:absolute; top:calc(100% + 6px); left:0;
+  width:360px; max-width:min(360px, calc(100vw - 240px));
+  background:var(--panel2); border:1px solid #2c3a5e; border-radius:10px;
+  padding:12px 14px; font-size:12px; line-height:1.65; color:var(--fg);
+  z-index:999; box-shadow:0 4px 20px rgba(0,0,0,0.45);
+  white-space:pre-wrap; word-wrap:break-word;
+}
+.tip-wrap:hover .tip-box, .tip-wrap:focus-within .tip-box, .tip-wrap.tip-open .tip-box { display:block; }
+@media (max-width:640px) {
+  .tip-box { position:fixed; top:52px; left:10px; right:10px; width:auto; max-width:none;
+    max-height:44vh; overflow:auto; }
+}

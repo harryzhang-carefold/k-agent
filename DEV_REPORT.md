@@ -1139,3 +1139,61 @@ const list = $('#sk-list'); if (list) list.innerHTML = _skillListHTML(canManage(
 | `shots/01~05_*.png` | 模型节点页列表 / endpoint 新建 / 测试连接 / Agent 模型下拉 / 旧 agent 编辑 |
 | `read_keys.py` / `start_containers.py` | key 读取 + 隔离容器启动（key 走 --env-file 0600，不落命令行/日志） |
 | `pg_baseline.txt` / `pg_after.txt` | pg-unified:agp 测试前后行数快照（复原对照） |
+
+# TASK-030 交付记录：需求2+3 — MCP 配置 tooltip + 长文本 4 策略 tooltip（2026-09-16，章北海，t_7c20c6bb）
+
+> 分支：`feat/ui-iter2`（接 TASK-029 d09a2c0，本卡全部提交在此分支）。
+> 任务书：`~/hermes-workspace/shared/tasks/T-AGP-UI-ITER2.md` §需求2、§需求3。本卡**不部署**（部署归 TASK-033）。
+> 范围：仅改前端 `src/static/ext.js` + `src/static/style.css`（原生 CSS/JS，零依赖、零构建），不影响任何后端/MCP/长文本功能。
+
+## 1. 实现说明
+
+两个区块标题旁各加一个 **info 图标 + hover tooltip**（纯 CSS `:hover`/`:focus-within`，无 JS 事件绑定、无新依赖），风格统一（共用 `.tip-wrap/.tip-icon/.tip-box` 一套样式，参考现有 `.k`/`.tag` 配色变量）。
+
+### 需求 2：MCP Servers 区块（`src/static/ext.js:73`）
+- 标题 "MCP Servers（stdio JSON-RPC · 内置 demo 真实进程）" 后插入 `_tipBox(MCP_TIP)`。
+- `MCP_TIP`（`src/static/ext.js:34`）内容：① 什么是 MCP Server（本地可执行命令 stdio JSON-RPC，平台 spawn 之并用 LSP Content-Length 帧通信，**仅 stdio、无 HTTP/SSE**，对齐 `src/mcp/mcp_client.py:1-6`）；② 配置步骤 ①名称→②command→③args→④env→⑤enabled→保存（对齐 `_showMcpForm` 字段）；③ **真实可跑示例**（容器内 `python3 /app/mcp/mcp_server_demo.py`，保存后点 tools/list 可见 `get_time`/`get_patient_demo` 两工具）+ 第二例演示 env 注入（`LOG_LEVEL=debug`）；④ 提示（保存后点 tools/list 验证、测试真实启动子进程、被 agent 引用删除 409 需先解绑，对齐 `extDelMcp` 确认文案）。
+
+### 需求 3：长文本 4 策略区块（`src/static/ext.js:426`）
+- 标题 "长文本 4 策略" 后插入 `_tipBox(LT_TIP)`。
+- `LT_TIP`（`src/static/ext.js:48`）：一两句概括（策略 1/2/3 真实调用 LLM、策略 4 纯 pandas 确定性）+ 4 条要点，**逐字对齐 `src/services/longtext.py` 头部 docstring（1-11 行）**。
+
+### 样式（`src/static/style.css:104-125`）
+- `.tip-wrap` 相对定位包裹，`.tip-icon` 16px 圆形 "i"（`--acc` 描边 + `cursor:help`，`tabindex=0` 支持键盘 focus 展开），`.tip-box` hover 时 `display:block` 绝对定位下展。
+- **窄屏/移动端不遮挡**：`@media (max-width:640px)` 时 `.tip-box` 改 `position:fixed`（顶部 52px、左右 10px 边距、`max-height:44vh` 可滚动）——实测 375px 宽下高度 308px（44vh），不横向溢出，下方 4 策略按钮/HITL 区在可滚动区域下方（不被永久覆盖），tooltip 移开即消失。
+
+## 2. 准确性核对（任务书硬约束：示例必须真实可跑，不编造）
+
+| 核对项 | 结论 | 依据 |
+|---|---|---|
+| demo 脚本真实路径 | `/app/mcp/mcp_server_demo.py` 成立 | `src/Dockerfile:4` `WORKDIR /app` + `COPY . .`（src 平铺到 /app）；`src/core/app.py:96-98` set_demo_script 指向 `<src>/mcp/mcp_server_demo.py` |
+| demo 工具名 | `get_time` / `get_patient_demo` 真实存在 | `src/mcp/mcp_server_demo.py:15-34` TOOLS 列表 |
+| **`--verbose` 参数** | **不存在，故未举** | 全脚本 `grep argv/argparse/verbose` 零命中，`main()` 直接读 stdin，不解析任何 CLI 参数。按"不存在就不要举"硬约束，第二例改以 env 注入演示，并如实注明"demo 脚本不消费该变量" |
+| MCP 仅 stdio 无 HTTP/SSE | 成立 | `src/mcp/mcp_client.py:1-6,52`（`create_subprocess_exec` + Content-Length 帧） |
+| 4 策略文案 | 与 docstring 逐字一致（含 2000-3000/重叠10-20%、MERGE 幂等、≤5 次、HITL 不硬失败、patient_id+date、不依赖 LLM） | `src/services/longtext.py:1-11`；脚本断言 10/10 关键短语全部命中 |
+| 删除 409 提示 | 成立 | `src/static/ext.js` `extDelMcp`（"若仍被 agent 引用，后端会返回 409 提示先解绑"） |
+
+## 3. 自测结果（真实运行，RISK-015 隔离容器）
+
+- **隔离容器** `t030-ui`：`docker run` 起 `agp-platform:t030`（sqlite 后端），映射 `8580→8099`（**不碰 8081 网关 / 8099 线上 agp-app / 哮喘 / pg-unified**），static 目录 `-v` 只读挂载（改 CSS/JS 即生效，无需重建镜像）。
+- **Playwright 自测**（`05-temp/t030/ui_test.py`，chromium headless）：登录 admin → 进 MCP-Skills 页 → hover 两个 info 图标 → 断言 tooltip 可见 + 内容完整（MCP 8 关键串 / 长文本 11 关键串）+ 移动端 fixed overlay 不遮挡。**结果 4/4 PASS，OVERALL PASS**（`05-temp/t030/ui_results.json`）。
+- **截图**（`05-temp/t030/shots/`）：
+  - `01_mcp_desktop.png` — 桌面 MCP tooltip（内容完整、含真实路径与工具名）
+  - `02_longtext_desktop.png` — 桌面长文本 tooltip（4 策略齐全）
+  - `03_mcp_mobile.png` / `04_longtext_mobile.png` — 375px 移动端（fixed 紧凑 overlay，不横向溢出）
+  - `00_page_ext_full.png` — MCP-Skills 整页基线
+- **现有功能不受影响**：MCP 增删改 / tools-list / call、长文本 4 策略按钮、HITL 队列渲染均未改动（仅标题旁插入只读 `<span>`，无 JS 逻辑变更）。
+
+## 4. 给 TASK-031 / 测试（云天明）的提示
+1. 本卡为纯前端展示增量，**无后端/接口/数据变更**，回归只需 UI 层：hover 两 tooltip 出现 + 内容正确 + 窄屏不遮挡 + 现有 MCP/长文本功能正常。
+2. 若后续 MCP 支持 HTTP/SSE 或 demo 脚本新增 CLI 参数（如真加 `--verbose`），需同步更新 `MCP_TIP` 文案（当前按"仅 stdio、无 --verbose"如实描述）。
+3. 移动端 tooltip 是 `position:fixed` 顶部 overlay（`max-height:44vh` 可滚动）——测试在窄屏验证时留意其展开/收起（鼠标移开即消失，不阻塞后续点击）。
+
+## 5. 自测证据索引（`05-temp/t030/`）
+| 文件 | 内容 |
+|---|---|
+| `ui_test.py` | Playwright 自测脚本（登录→hover→断言，桌面+移动双 viewport） |
+| `ui_results.json` | 4/4 PASS 结果（含移动端 fixed overlay 几何：y=52,w=355,h=308） |
+| `shots/01~04_*.png` | 桌面 MCP/长文本 tooltip + 移动端两例 + 整页基线 |
+| `t030.env` | 隔离容器 env（sqlite，dummy LLM key——UI tooltip 自测无需真实 LLM） |
+| `data/` | 隔离容器 sqlite 数据目录（一次性自测，不复用） |

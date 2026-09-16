@@ -21,6 +21,38 @@
   let _skillEditId = null;
   let _mcpEditId = null;
 
+  // ---------- TASK-030: info tooltip（纯 CSS hover，原生实现无依赖） ----------
+  function _tipBox(content) {
+    return '<span class="tip-wrap" tabindex="0">' +
+      '<span class="tip-icon" aria-label="说明">i</span>' +
+      '<span class="tip-box" role="tooltip">' + esc(content) + '</span></span>';
+  }
+
+  // 文案与 src/mcp/mcp_client.py（stdio only, LSP Content-Length 帧）+
+  // src/mcp/mcp_server_demo.py（容器内 /app/mcp/mcp_server_demo.py，工具
+  // get_time/get_patient_demo；脚本不解析任何 CLI 参数，故不举 --verbose）一致
+  const MCP_TIP = [
+    'MCP Server：本地可执行命令（stdio JSON-RPC），平台 spawn 它并用 LSP Content-Length 帧通信。仅支持 stdio，无 HTTP/SSE。',
+    '',
+    '配置步骤：',
+    '① 唯一名称 → ② command（可执行程序，如 python3 / node / 绝对路径）→ ③ args（脚本路径+参数）→ ④ 可选 env 键值对（注入子进程环境变量）→ ⑤ 勾 enabled → 保存',
+    '',
+    '真实示例（容器内可跑，demo 为仓库内置）：',
+    '· 名称 demo，command python3，args /app/mcp/mcp_server_demo.py —— 即当前已存在的内置 demo server，保存后点 tools/list 可见 get_time / get_patient_demo 两个工具',
+    '· 再建一个：command python3，args /app/mcp/mcp_server_demo.py，env LOG_LEVEL=debug（env 注入子进程；demo 脚本不消费该变量，仅演示 env 配置方式）',
+    '',
+    '提示：保存后点 tools/list 验证连接（测试会真实启动子进程）；被 agent 引用的 server 删除会 409，需先解绑。',
+  ].join('\n');
+
+  // 文案逐字对齐 src/services/longtext.py 头部 docstring（1-11 行）
+  const LT_TIP = [
+    '长文本 4 策略（services/longtext.py）：处理超长临床文本。策略 1/2/3 真实调用 LLM，策略 4 为纯 pandas 确定性处理。',
+    '1. Map-Reduce：2000-3000 token 滑窗分块（重叠 10-20%）→ 逐块 LLM 提取检验指标 → LLM 聚合去重/时间线排序/冲突标"需人工复核"；平台侧兜底：同名指标单位不一致强制标"需人工复核"。',
+    '2. 增量图构建：流式逐段 → LLM 仅输出标准三元组 JSON → MERGE 写入 L2 图（幂等）→ 最终只查子图摘要，不回顾原文。',
+    '3. critique-refine：pydantic QAItem 校验（question/answer/source_field、数值非负）→ 失败带具体错误重喂 LLM ≤5 次 → 达上限转 HITL 人工待办队列（不硬失败）。',
+    '4. pandas 确定性预处理：散乱检验记录 CSV → 清洗/按 patient_id+date 聚合 → 结构化 JSON（不依赖 LLM）。',
+  ].join('\n');
+
   async function loadExt() {
     const [pl, sk, mc, lt] = await Promise.all([
       api('/api/ext/plugins').catch(() => ({ plugins: [] })),
@@ -38,7 +70,7 @@
         ? '✓ 你有 <span class="tag acc">ext:manage</span> 权限，可增删改。'
         : '只读模式：你当前没有 <span class="tag warn">ext:manage</span> 权限，写入入口已禁用（后端同样 403）。') + '</div>' +
       '<div class="panel">' + renderSkillsPanel(M) + '</div>' +
-      '<div class="panel"><h3>MCP Servers（stdio JSON-RPC · 内置 demo 真实进程）</h3>' +
+      '<div class="panel"><h3>MCP Servers（stdio JSON-RPC · 内置 demo 真实进程）' + _tipBox(MCP_TIP) + '</h3>' +
         renderMcpPanel(M) + '</div>' +
       '<div class="panel"><h3>Plugins（内置可调用能力 · 只读）</h3>' +
         (pl.plugins || []).map(p =>
@@ -391,7 +423,7 @@
 
   // ---------- 长文本 4 策略（保持原有） ----------
   function renderLongtextPanel(lt) {
-    return '<div class="panel"><h3>长文本 4 策略</h3>' +
+    return '<div class="panel"><h3>长文本 4 策略' + _tipBox(LT_TIP) + '</h3>' +
       '<div class="row"><div><label>长文本（策略1/2 输入）</label><textarea id="lt-text" rows="5">' +
       '患者王建国，52岁。2026-07-14 门诊：FEV1 2.10 L，IgE 410.20 KU/L，控制不佳，加用孟鲁司特。' +
       '2026-09-09 门诊：支气管舒张试验阳性，FEV1 改善 240 ml，IgE 394.00 KU/L，尘螨皮试阳性。' +
