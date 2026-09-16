@@ -1311,3 +1311,119 @@ PG 容器 seed 幂等性：`pg_snap.py before/after` 18 张表行数逐一比对
 2. 回归时若用 `<select multiple>` 自动化，注意 **Ctrl+click 才是多选语义**（纯 click 是替换选择）——自测脚本已按此实现。
 3. 线上部署后核对：Agent 表单 plugins 下拉 3 项（get_time/mcp_call/echo）来自 `GET /api/ext/plugins`（线上当前与源码一致，registry 未变）；新增插件后前端自动出现（本卡已用临时插件验证）。
 4. 测试 agent 已清理（sqlite 卷随容器删除）；pg-unified:agp 数据零变更（18 表行数 before/after 一致）。
+
+---
+
+# TASK-034 — 修复 BUG-007：endpoint 删除/停用后 agent 回退 S.LLM_MODEL（同步+流式双路径）
+
+> 章北海 · 2026-09-16 · feat/ui-iter2 @ **d108944**（上一最终 commit 886543f 之上）
+
+## 1. 根因（TASK-032 发现 / TASK-033 褚岩独立黑盒确认）
+
+`src/engine/agent_engine.py`：agent.model 存 endpoint **name**（绑定标识）。同步路径
+`_tool_loop`（原 237-239 行）与流式路径 `run_stream`（原 298-300 行）均为：
+
+```python
+if agent.get("model"):
+    args["model"] = agent["model"]          # 先塞 endpoint name（如 "t033-del"）
+args.update(await self._endpoint_kwargs(agent))  # 端点被删/停用 → 返回 {}，不覆盖 model
+```
+
+`_endpoint_kwargs`（199-231 行）在"查不到 / is_active=0 / 表异常"时 `return {}`，
+只覆盖 base_url/api_key/timeout，**不回退 model 到 S.LLM_MODEL**。后果：endpoint
+被删/停用后 payload model 停在 endpoint name → 发给系统默认端点（真 vLLM）→
+404 model does not exist → `KeyError: 'choices'` → 重试 3 次 → 降级（degraded）。
+违反需求1"选不到时回退默认不崩"+ RISK-018 兜底不变式。
+
+## 2. 修复方式（两处同改，不得只改一处）
+
+`_tool_loop`（同步）与 `run_stream`（流式）统一改为：
+
+```python
+_epk = await self._endpoint_kwargs(agent)
+if _epk:                      # endpoint 解析成功（返回含 base_url 的 dict）
+    args.update(_epk)         # 才用端点行覆盖 base_url/api_key/timeout/model
+elif agent.get("model"):      # 解析失败（查不到/停用/已删/表异常）且 model 非空
+    args["model"] = S.LLM_MODEL  # 回退系统默认模型，走 S.LLM_BASE_URL
+```
+
+行为矩阵：
+
+| agent.model | endpoint 行 | 修复后行为 |
+|---|---|---|
+| 空 | — | 不变：S.* 默认（provider 默认 model） |
+| = endpoint name，**启用** | 存在 is_active=1 | 不变：端点行覆盖 base_url/api_key/timeout/model |
+| = endpoint name，**停用/已删/查不到/表异常** | 无 | **新**：model 回退 S.LLM_MODEL → 系统默认端点，degraded=false |
+| **旧自由文本**（如 vllm-qwen3.8-27b，非 endpoint name） | 查不到 | **新**：model 回退 S.LLM_MODEL（与旧值相同，行为不变；RISK-018 向后兼容） |
+
+不回归面：① 正常 endpoint 对话真实走对应 base_url/model（含假 endpoint 受控降级
+不 500）；② 旧自由文本 agent 既有对话不变；③ system-default 兜底端点 seed 不变式
+（至少保留一个可用系统默认端点，DELETE 409）未动。
+
+## 3. 双后端自测证据（RISK-015 全程 docker run 隔离，未动线上 8099/8081/哮喘/gh）
+
+镜像 `agp-platform:t034`（修复后源码构建；镜像内 agent_engine.py 两处含
+"BUG-007 回退" 注释已核）。密钥经容器 env 注入（profile .env 读取，未打印、
+未进镜像/.dockerignore 排除 .env）。
+
+### 3.1 sqlite 全新卷（`t034-sqlite` :8999，全新卷 `/app/data/agp.db`）
+
+探针 `05-temp/t034/t034_probe.py` → `05-temp/t034/t034_probe_out.json`，**verdict=PASS**：
+
+| 检查 | 结果 |
+|---|---|
+| A 删除 endpoint 后绑定 agent 对话 | 200，**degraded=false**，llm_calls=1，真实答案 2155330（=9371*23）✅ |
+| B 停用 endpoint（is_active=0）后对话 | 200，**degraded=false**，llm_calls=1，真实答案 1593070（=93710*17）✅ |
+| C 正常启用 endpoint 对话（不回归） | 200，degraded=false，llm_calls=1，真实答案 1218230 ✅ |
+| D 假 endpoint（base_url 不可达）对话 | 200，**degraded=true**（受控降级不 500，行为保持）✅ |
+| E 旧自由文本 agent（model=vllm-qwen3.8-27b）对话（不回归） | 200，degraded=false，llm_calls=1，真实答案 655970 ✅ |
+| F system-default 兜底端点存在且启用 | ✅（model=vllm-qwen3.8-27b，base=真 vLLM） |
+
+### 3.2 PG 连共享 pg-unified（`t034-pg` :9001，agp schema，agp_default 网络）
+
+探针 `05-temp/t034/t034_probe_pg.py`（容器内运行），**verdict=PASS**：
+
+| 检查 | 结果 |
+|---|---|
+| A 删除 endpoint 后对话 | 200，degraded=false，llm_calls=1，真实答案 959744 ✅ |
+| B 停用 endpoint 后对话 | 200，degraded=false，llm_calls=1，真实答案 709376 ✅ |
+| C 正常 endpoint 对话 | 200，degraded=false，llm_calls=1，真实答案 542464 ✅ |
+| E 旧自由文本 agent 对话 | 200，degraded=false，llm_calls=1，真实答案 292096 ✅ |
+| 前后快照 t034pg- 前缀 endpoint/agent | before/after 均为空 ✅ |
+
+**双后端一致：引擎缺陷后端无关，修复后 sqlite + PG 均 degraded=false 且真实答案。**
+
+## 4. 共享 pg-unified 测试残留（**已记录复原 SQL，未执行**——destructive 操作交 PM/用户确认）
+
+探针创建的 4 个 agent/endpoint 已全部经 API 删除；但 `DELETE /api/agents/{id}`
+不级联 conversations/messages（既有行为），残留 4 条孤儿 conversations + 8 条
+messages（无 memory_l1，算术短答案未过语义缓存阈值；无 t034pg- 前缀 agent/
+endpoint 残留）。精确复原 SQL（`05-temp/t034/pg_residue.json`，**交下游/PM 确认
+后执行**，本卡不自行执行）：
+
+```sql
+DELETE FROM agp.messages WHERE id IN (1021,1022,1023,1024,1025,1026,1027,1028);
+DELETE FROM agp.conversations WHERE id IN ('c10bc0e23b248','caa33a8ce9d04','cdf058180cf7e','c3c9001797871');
+```
+
+## 5. 纪律自检
+
+- 改动仅 `src/engine/agent_engine.py`（+20/-6，纯后端）；前端零改动（本 bug 纯后端）✅
+- 零硬编码密钥（镜像 src/*.py 真实 key 0 命中；key 经容器 env 注入，未进命令行/日志）✅
+- 临时文件全在 `05-temp/t034/`（t034_probe.py / t034_probe_pg.py / t034_launch.py /
+  t034_pg_residue_audit.py / t034_probe_out.json / pg_residue.json / data/）✅
+- 全程 `docker run` 隔离（t034-sqlite :8999 全新卷 / t034-pg :9001）；未用项目
+  compose、未动线上 agp-app 8099/8081/哮喘/gh/pg-unified 数据（除上述已记录残留）✅
+- 未 merge main、未部署、未构建 1.3.0（TASK-036 范围）✅
+
+## 6. 给 TASK-035（云天明回归）/ TASK-036（褚岩复审）的提示
+
+1. 修复 commit：**feat/ui-iter2 @ d108944**（单一文件 agent_engine.py，两处同改）。
+   回归面 = 同步 chat（/api/chat/{id}）+ 流式 WS（/ws/chat）两条路径的 endpoint
+   解析回退；重点：删除/停用 endpoint 后对话 degraded=false + 真实答案（sqlite + PG 双端）。
+2. 回归建议用例：① 删除 endpoint 后绑定 agent 对话（本卡 A 场景）；② 停用
+   （PUT is_active=0）后对话（B 场景）；③ 正常 endpoint 对话不回归（C）；④ 假
+   endpoint（不可达 base_url）受控降级不 500（D）；⑤ 旧自由文本 agent 对话
+   不回归（E）；⑥ system-default 兜底端点仍在（F）。
+3. 共享 pg-unified 残留复原 SQL 见 §4（pg_residue.json），destructive 操作请确认
+   后执行（同 TASK-033 遗留：05-temp/t032/pg_contamination_record.json 亦待用户确认）。
