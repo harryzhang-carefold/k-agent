@@ -10,4 +10,5 @@ PyJWT
 python-multipart
 websockets
 websocket-client
+PyYAML
 pytest

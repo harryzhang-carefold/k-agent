@@ -20,6 +20,8 @@ CREATE TABLE IF NOT EXISTS agents (
   temperature REAL DEFAULT 0.2,
   max_tokens INTEGER DEFAULT 1024,
   top_p REAL DEFAULT 0.9,
+  backend TEXT NOT NULL DEFAULT 'custom',       -- TASK-037: custom(内置引擎) | hermes(hermes CLI 后端)
+  hermes_profile TEXT,                          -- TASK-037: backend=hermes 时指向的 hermes profile 名
   created_at TEXT DEFAULT (datetime('now')),
   updated_at TEXT DEFAULT (datetime('now'))
 );

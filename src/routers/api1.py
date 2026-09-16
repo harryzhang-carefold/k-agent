@@ -6,6 +6,7 @@ import zipfile
 from fastapi import APIRouter, Request, Depends
 from pydantic import BaseModel
 from core import db
+from core import hermes_cli
 from core.errors import APIError
 from core.security import (current_user, require_perm, verify_password,
                            create_token, ROLE_MATRIX, PERMISSIONS)
@@ -57,7 +58,48 @@ class AgentIn(BaseModel):
     temperature: float = 0.2
     max_tokens: int = 1024
     top_p: float = 0.9
+    backend: str = "custom"            # TASK-037: custom | hermes
+    hermes_profile: str | None = None  # TASK-037: backend=hermes 时必填
     bindings: list[dict] | None = None  # [{"type": "skill|mcp|plugin|rag|memory", "ref_id": str}]
+
+
+_VALID_BACKENDS = ("custom", "hermes")
+
+
+def _normalize_agent_backend(body: AgentIn) -> tuple[str, str]:
+    """校验 backend + hermes_profile 语义（任务书 §四.4）。
+
+    返回 (backend, hermes_profile)；backend=custom 时 hermes_profile 返回 ""
+    （落库为 None，由调用方处理——这里用空串避免 str|None 联合类型噪声）。
+    """
+    b = (body.backend or "custom").lower()
+    if b not in _VALID_BACKENDS:
+        raise APIError(400, f"backend 必须是 {'|'.join(_VALID_BACKENDS)}，收到 {body.backend!r}")
+    if b == "hermes":
+        if not body.hermes_profile:
+            raise APIError(400, "backend=hermes 时必须指定 hermes_profile")
+        # 任务书 §四.4: 创建 hermes agent 时 name 与 profile 名一致
+        if body.name != body.hermes_profile:
+            raise APIError(400,
+                           f"hermes agent 的 name 必须与 hermes_profile 一致"
+                           f"（name={body.name!r}, profile={body.hermes_profile!r}）")
+        return "hermes", body.hermes_profile
+    else:
+        # custom 后端忽略 hermes_profile（落库 NULL）
+        return "custom", ""
+
+
+async def _check_profile_exists(profile_name: str) -> bool:
+    """检查 hermes profile 是否存在（400 校验用）。CLI 不可用 → False（400）。"""
+    if not hermes_cli.hermes_available():
+        return False
+    try:
+        await hermes_cli.show_profile(profile_name)
+        return True
+    except hermes_cli.HermesCLIError:
+        return False
+    except Exception:
+        return False
 
 
 async def _validate_bindings(conn, bindings: list[dict]):
@@ -117,16 +159,22 @@ async def create_agent(body: AgentIn, request: Request,
     if await db.fetchone(conn, "SELECT id FROM agents WHERE name=?", (body.name,)):
         raise APIError(409, f"agent 重名: {body.name}")
     await _validate_bindings(conn, body.bindings)
+    # TASK-037: 校验 backend + hermes_profile 语义
+    backend, hermes_profile = _normalize_agent_backend(body)
+    if backend == "hermes" and not await _check_profile_exists(hermes_profile):
+        raise APIError(400, f"hermes profile 不存在: {hermes_profile}（请先通过 /api/hermes/profiles 创建）")
+    stored_profile = hermes_profile or None
     aid = await db.execute(
         conn,
-        """INSERT INTO agents (name, description, system_prompt, model, temperature, max_tokens, top_p)
-           VALUES (?,?,?,?,?,?,?)""",
+        """INSERT INTO agents (name, description, system_prompt, model, temperature, max_tokens, top_p,
+                                backend, hermes_profile)
+           VALUES (?,?,?,?,?,?,?,?,?)""",
         (body.name, body.description, body.system_prompt, body.model,
-         body.temperature, body.max_tokens, body.top_p))
+         body.temperature, body.max_tokens, body.top_p, backend, stored_profile))
     for b in body.bindings or []:
         await db.execute(conn, "INSERT OR IGNORE INTO agent_bindings (agent_id, type, ref_id) VALUES (?,?,?)",
                          (aid, b["type"], str(b["ref_id"])))
-    return {"id": aid, "name": body.name}
+    return {"id": aid, "name": body.name, "backend": backend, "hermes_profile": stored_profile}
 
 
 @agents.put("/{agent_id}")
@@ -140,28 +188,43 @@ async def update_agent(agent_id: int, body: AgentIn, request: Request,
         if await db.fetchone(conn, "SELECT id FROM agents WHERE name=?", (body.name,)):
             raise APIError(409, f"agent 重名: {body.name}")
     await _validate_bindings(conn, body.bindings)
+    # TASK-037: 校验 backend + hermes_profile 语义
+    backend, hermes_profile = _normalize_agent_backend(body)
+    if backend == "hermes" and not await _check_profile_exists(hermes_profile):
+        raise APIError(400, f"hermes profile 不存在: {hermes_profile}（请先通过 /api/hermes/profiles 创建）")
+    stored_profile = hermes_profile or None
     await db.execute(
         conn,
         """UPDATE agents SET name=?, description=?, system_prompt=?, model=?, temperature=?,
-           max_tokens=?, top_p=?, updated_at=datetime('now') WHERE id=?""",
+           max_tokens=?, top_p=?, backend=?, hermes_profile=?, updated_at=datetime('now') WHERE id=?""",
         (body.name, body.description, body.system_prompt, body.model,
-         body.temperature, body.max_tokens, body.top_p, agent_id))
+         body.temperature, body.max_tokens, body.top_p, backend, stored_profile, agent_id))
     await db.execute(conn, "DELETE FROM agent_bindings WHERE agent_id=?", (agent_id,))
     for b in body.bindings or []:
         await db.execute(conn, "INSERT OR IGNORE INTO agent_bindings (agent_id, type, ref_id) VALUES (?,?,?)",
                          (agent_id, b["type"], str(b["ref_id"])))
-    return {"id": agent_id, "updated": True}
+    return {"id": agent_id, "updated": True, "backend": backend, "hermes_profile": stored_profile}
 
 
 @agents.delete("/{agent_id}")
 async def delete_agent(agent_id: int, request: Request,
                        user: dict = Depends(require_perm("agent:delete"))):
     conn = request.app.state.db
-    if not await db.fetchone(conn, "SELECT id FROM agents WHERE id=?", (agent_id,)):
+    agent = await db.fetchone(conn, "SELECT * FROM agents WHERE id=?", (agent_id,))
+    if not agent:
         raise APIError(404, "agent 不存在")
+    # TASK-037 §四.4: 删除 hermes agent 默认不联动删 profile（profile 保留，响应提示）
+    is_hermes = (agent.get("backend") or "custom").lower() == "hermes"
+    profile_kept = None
+    if is_hermes:
+        profile_kept = agent.get("hermes_profile")
     await db.execute(conn, "DELETE FROM agent_bindings WHERE agent_id=?", (agent_id,))
     await db.execute(conn, "DELETE FROM agents WHERE id=?", (agent_id,))
-    return {"id": agent_id, "deleted": True}
+    resp = {"id": agent_id, "deleted": True}
+    if profile_kept:
+        resp["hermes_profile"] = profile_kept
+        resp["note"] = f"hermes profile {profile_kept!r} 已保留（未联动删除；如需删除请调 DELETE /api/hermes/profiles/{profile_kept}）"
+    return resp
 
 
 @agents.get("/{agent_id}/prompt")

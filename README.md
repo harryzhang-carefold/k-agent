@@ -20,6 +20,7 @@
 | **LLM endpoint 多维护（阶段五）** | 新表 `llm_endpoints`（双后端幂等）+ `/api/llm-endpoints` CRUD/连通测试/设默认；api_key 只回 `key_set`+末4位（0 明文）；Agent 模型字段改**下拉选择 endpoint**；对话按 endpoint 真实路由 base_url/api_key，endpoint 删除/停用后回退系统默认 `S.LLM_MODEL`（BUG-007 已修复，不崩） |
 | **MCP / 长文本 tooltip（阶段五）** | MCP 配置 + 长文本 4 策略信息 tooltip（纯 CSS hover 原生实现），文案与 `mcp_server_demo.py` 实际参数 / `longtext.py` docstring 逐条核对，窄屏不遮挡 |
 | **Agent 绑定端到端（阶段五）** | Skill/MCP/RAG/**Plugins（动态下拉 GET /api/ext/plugins）** 四选绑定，保存落库 + Prompt 预览体现生效（工具 schema 注入） |
+| **Hermes Agent 双后端（阶段六）** | Agent 可选 `custom`（内置引擎，零回归）/ `hermes`（hermes CLI profile 后端）：`/api/hermes/profiles` CRUD + `/status` 探测（CLI 缺失优雅 503）；hermes 对话=同步 `hermes -p <profile> -z` + WS 流式（整段 token）+ L0 记忆照写 + 受控降级（不裸 500）；profile 创建即零工具面（仅对话）；api_key 全程脱敏（AC-H9）；双后端（sqlite/PG）幂等迁移 |
 | **API 与前端** | REST `/api/*` + WebSocket `/ws/chat/{agent}/{conv}`（流式）；纯原生 JS SPA（无框架） |
 | **可观测** | `/healthz` 健康检查（含 LLM/embedding/DB/记忆后端状态） |
 
@@ -168,10 +169,10 @@ tests/           pytest 套件（auth/agents/chat/rag/memory/mcp/longtext/ws）
 
 | 项 | 值 |
 |---|---|
-| 镜像 | `agp-platform:1.3.0`（build: `./src/Dockerfile`, python:3.12-slim；阶段五含 LLM endpoint 多维护 + BUG-007 修复 `d108944`。历史线上为 `1.2.0-dual`，保留为回滚锚点） |
+| 镜像 | `agp-platform:1.4.0`（build: `./src/Dockerfile`, python:3.12-slim；阶段六含 Hermes Agent 双后端接入。回滚锚点 `1.3.0`/`1.2.0-dual` 保留） |
 | 容器名 | `agp-app`，`restart: unless-stopped` |
 | 端口 | `8099:8099` |
-| 卷 | `./src/data:/app/data`（持久化 `agp.db`，sqlite 模式重启不丢数据） |
+| 卷 | `./src/data:/app/data`（持久化 `agp.db`，sqlite 模式重启不丢数据）；**Hermes（可选）**: `/home/hermes/.hermes:/home/hermes/.hermes`（宿主 hermes 运行时：venv + profiles + .env）+ `/home/hermes/.local/share/uv:/home/hermes/.local/share/uv`（venv python 符号链接目标）。未挂载的环境 hermes 功能优雅 503，custom 不受影响 |
 | 网络 | 默认（sqlite）不需要外部网络；PG 模式叠加 `docker-compose.pg.yml` 接外部网络 `agp_default`（直连 pg-unified） |
 | 资源 | `mem_limit: 512m`，`cpus: 1.0` |
 | healthcheck | 每 15s 探 `/healthz`（start_period 20s） |

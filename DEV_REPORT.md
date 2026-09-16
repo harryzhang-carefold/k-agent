@@ -1505,3 +1505,95 @@ DELETE FROM agp.conversations WHERE id IN ('c10bc0e23b248','caa33a8ce9d04','cdf0
 - `00-management/STATUS.md`：阶段五终审结论 + 剩余风险清单更新（本卡）。
 - `03-testing/BUGS.md` BUG-007 维持 FIXED；`03-testing/TEST_REPORT.md` 维持 §TASK-035 PASS。
 - 证据 `05-temp/t036/`（baseline_before.txt / pg_snapshot_*.json / t036_probe.py / t036_ui.js / ws_client.py / 双端+线上结果 JSON / t036_pg_residue*.json / t036_pg_residue_restore.sql / deploy_130.sh / shots/*.png）。
+
+---
+
+# TASK-037 · 阶段六核心开发：Hermes Agent 双后端接入（后端全量）（2026-09-16，章北海，t_5fafc793）
+
+分支 `feat/hermes-agent`（自 main `7607e52` 切出），目标镜像 tag `agp-platform:1.4.0`，回滚锚点 `1.3.0`。**本卡不 merge main、不部署线上**（TASK-040 范围）。
+
+## 1. 实现说明（对照任务书 §四 方案）
+
+### 1.1 数据模型（agents 双 schema 幂等迁移）
+- `src/core/schema_sqlite.sql`：agents 表加 `backend TEXT NOT NULL DEFAULT 'custom'` + `hermes_profile TEXT`（新库直接带列）。
+- `src/core/db.py`：PG（`_pg_init`，`ADD COLUMN IF NOT EXISTS`）与 SQLite（`_sqlite_init`，`ALTER TABLE ADD COLUMN` + 失败静默幂等）双路径加列；旧数据自动落 `backend='custom'`，**零感知**（AC-H4d 自测：既有 agent 全部 custom）。
+
+### 1.2 /api/hermes/* 5 接口 + status 探测（`src/routers/api_hermes.py`，新增）
+| 端点 | 权限 | 行为 |
+|---|---|---|
+| `GET /api/hermes/status` | 登录即可 | `{available, message}`——前端判断是否显示 hermes 选项（前端属 TASK-038） |
+| `GET /api/hermes/profiles` | agent:read / ext:manage | `hermes profile list` 表格 → JSON 数组 |
+| `POST /api/hermes/profiles` | agent:create / ext:manage | `{name, description?, clone_from?}` → `profile create`；未指定 clone 源时自动从「配了 model provider」的 profile 克隆（默认 default）；创建后**强制零工具面**（见 1.4） |
+| `GET /api/hermes/profiles/{name}` | agent:read / ext:manage | `profile show` + 本地补读 description（`profile describe` 写入 profile.yaml，CLI show 不打印） |
+| `PUT /api/hermes/profiles/{name}` | agent:update / ext:manage | `profile describe --text` |
+| `DELETE /api/hermes/profiles/{name}` | agent:delete / ext:manage | `profile delete -y` |
+
+统一 `asyncio.create_subprocess_exec`（**禁 shell=True**，`src/core/hermes_cli.py`），PATH 注入 `~/.local/bin`，超时 60s，非 0 退出码 → 结构化 `{error}`（4xx）；CLI 不可用（`shutil.which` 找不到 wrapper **或** wrapper 指向的 venv python 缺失——容器未挂 `~/.hermes` 的常见情形）→ 全部 503 + 明确提示（AC-H7）。
+
+### 1.3 对话路由（`src/engine/hermes_adapter.py`，新增；`api2.py` chat/WS 分派）
+- `POST /api/chat/{agent_id}` 与 `WS /ws/chat/{agent_id}/{conv_id}` 读 `agent.backend` 分派：
+  - `custom` → 原 `AgentEngine` 链路**零改动**（AC-H4 铁律；BUG-007 回退逻辑 `agent_engine.py:243-247,310-314` 未触碰——本卡 diff 不含 agent_engine.py）。
+  - `hermes` → `HermesAgentAdapter`：同步 `hermes -p <profile> -z "<text>"` stdout 整段作 answer；流式逐行读 stdout 转 WS token（`-z` 实为结尾一次性吐出 → 整段发一次，前端兼容）；**L0 记忆照写**（memory backend `l0_append`，conversation/messages 表与 custom 一致）；**不传 AGP history**（hermes 用自身 session 记忆；`--resume` 多轮连贯列 P1，本卡不做）。
+  - 无 tool loop / 无 RAG / 无 AGP 缓存路由（任务书需求2）。
+  - 进程失败/超时（`HERMES_CHAT_TIMEOUT` 默认 120s）/CLI 不可用 → **受控降级**：HTTP 200 + `degraded:true` + 提示文案（同 AC-14 风格，不裸 500）。
+- **安全修复（本卡事故直接产物）**：`hermes_cli._env()` 子进程环境**剥离 `HERMES_KANBAN_*` / `HERMES_PROFILE` / `HERMES_YOLO_MODE` / `HERMES_TASK_ID`**，并显式固定 `HERMES_HOME`/`HOME`。根因：`hermes -z` 继承父进程（AGP worker 自身是 kanban worker）的环境变量会误认自己是 kanban worker、加载全量工具并真的操作共享 kanban 板（2026-09-16 18:26 事故：探测子进程误调 `kanban_block` 把本任务标 blocked）。剥离后 `-z` 只做纯对话。
+
+### 1.4 profile 创建即零工具面（「默认仅对话」的工程保证）
+实测：`-z` 按 profile `config.yaml` 的 `platform_toolsets.cli` 加载工具跑 agent 工具循环（approvals 自动绕过），既有改文件/调 kanban/开浏览器的真实副作用（上述事故即由此放大）。因此 `hermes_cli._neutralize_profile_tools` 在 profile 创建后：
+- 写 `platform_toolsets.cli: []` + `skills: {}` 到 `<profile>/config.yaml`（不存在则创建最小文件）；
+- 删除 skills 目录；
+- **回读确认 `cli == []`**（不信任「写了就算」），结果进 API 响应 `tools_disabled` 字段。
+失败不阻断创建，但响应显式 `tools_disabled:false`，自测/验收前必须确认为 true。
+
+### 1.5 hermes agent 语义（`api1.py`）
+- `POST/PUT /api/agents` 接受 `backend`（custom|hermes）+ `hermes_profile`；hermes 时 **name 必须与 profile 名一致**（400）+ **profile 必须已存在**（`profile show` 探测，400，CLI 不可用也 400 并提示先装 hermes）。
+- 删除 hermes agent **默认不联动删 profile**：agent 行删除后 profile 保留，响应 `note` 明示（前端 confirm 属 TASK-038）。
+- create/update/delete 响应统一带 `backend`/`hermes_profile` 字段。
+
+### 1.6 部署改造（Dockerfile / compose）
+- `src/Dockerfile`：
+  - 内置 hermes wrapper（`/home/hermes/.local/bin/hermes`，与宿主 wrapper 语义一致，指向 `/home/hermes/.hermes/hermes-agent/venv/bin/python` + `hermes` 入口）；
+  - `ENV HERMES_HOME=/home/hermes/.hermes` + PATH 注入 `~/.local/bin`；
+  - **容器以 hermes 用户（uid/gid 1000，与宿主一致）运行**：挂载的宿主 `~/.hermes` 属主为宿主 hermes 用户，root 运行会在宿主目录产生 root:root 文件反噬宿主读写；
+  - `.env 不进镜像`（`.dockerignore` 已排除 `.env`；DECISION-004 密钥纪律）。
+- `docker-compose.yml`：image tag `1.3.0 → 1.4.0`；`HERMES_HOME` env + 两个挂载：
+  - `/home/hermes/.hermes:/home/hermes/.hermes`（hermes-agent venv + profiles + .env）
+  - `/home/hermes/.local/share/uv:/home/hermes/.local/share/uv`（venv 的 python 符号链接指向 uv 管理的 CPython，不挂则 venv 不可用）
+  - 宿主目录不存在时 docker 创建空目录 → `hermes_available()=False` → 503 优雅降级（AC-H7 双模式兼容）。
+- `requirements.txt` + `PyYAML`（profile config.yaml 解析/写入）。
+
+## 2. 风险章节（**PM 要求必须显式列出**）
+
+| # | 风险 | 说明 | 处置 |
+|---|---|---|---|
+| R1 | **挂载宿主 `~/.hermes` = 容器可读写全部 hermes profile 数据**（含全部 profile 的会话/记忆/配置，以及 `.env` 中的 LLM API key） | PM 已决策**可接受**（单机部署场景，宿主与容器同一信任域） | 写入本章节 + 测试报告；缓解：卷宿主权限 600、容器以 hermes 用户（uid 1000）运行不产生 root 文件；多机/多租户部署前需重新评估（只读挂载 + 独立 HERMES_HOME 子目录方案在任务书 §四.4 备选） |
+| R2 | **`.env` 密钥纪律** | `.env` **不进镜像**（`.dockerignore` 排除，镜像层无密钥）；仅经 bind-mount 运行时对容器可见 | 宿主 `~/.hermes/.env` 权限 600；API 响应/日志对 api_key/token/secret/password 值统一脱敏为 `****末4位`（AC-H9，自测通过） |
+| R3 | **`hermes -z` 子进程继承环境变量的副作用** | `-z` 默认加载 profile 全量工具 + approvals 自动绕过 + 继承父进程环境变量；若继承 `HERMES_KANBAN_*` 会误认 kanban 身份并操作共享看板（本卡实际发生一次） | `hermes_cli._env()` 强制剥离运行身份变量；AGP 创建的 profile 强制零工具面（1.4）+ 回读确认；**AGP 之外手工创建的 profile 不享受零工具面保证**——用 AGP hermes agent 对话前建议核对该 profile `tools_disabled` 或手动清空 cli 工具面 |
+| R4 | 容器内 hermes 依赖宿主 uv python（符号链接） | 需同时挂载 `~/.local/share/uv`；换主机/uv 版本变化时 venv 可能失效 | `hermes_available()` 探测 wrapper **和** venv python 双重存在；失效即 503 优雅降级 |
+| R5 | hermes profile 名与 AGP agent name 强一致约束 | 用户直接 CLI 改名 profile 后 AGP agent 对话会降级（profile 不存在 → 受控降级提示） | 降级文案含原因（AC-H7 风格）；前端提示属 TASK-038 |
+| R6 | 多轮连贯（P1 可选） | 本卡不传 AGP history、不做 `--resume`；hermes 靠自身 session 记忆，`-z` 一次性调用每轮是新 session | 列 P1（任务书已定），本卡范围外 |
+
+## 3. 自测证据（RISK-015：全程 docker run 隔离，未动线上 8099 agp-app、未动 pg-unified 既有数据）
+
+- **sqlite 隔离容器** `t037-sqlite:8199`（image `agp-platform:t037`，数据卷 `05-temp/t037/t037-sqlite-data`，挂载 `~/.hermes` + `~/.local/share/uv`）：`t037_selftest.py`（AC-H1~H5/H7/H9 + status/400 校验/旧 agent 零感知）→ **28/28 PASS**，结果 `05-temp/t037/result_sqlite.json`。
+- **PG 隔离容器** `t037-pg:8299`（同 image，`DB_BACKEND=postgres` 连 pg-unified `agp` schema，网络 `agp_default`）：同脚本 → **28/28 PASS**，结果 `05-temp/t037/result_pg.json`。PG 侧唯一 schema 副作用 = 启动幂等迁移给 `agp.agents` 加 2 列（`ADD COLUMN IF NOT EXISTS`，非破坏性，psql 核对列已存在：backend text NOT NULL DEFAULT 'custom' / hermes_profile text）；既有 6 agent 行零改动（AC-H4d 零感知）。
+- **CLI 缺失 503（AC-H7 前半）**：`t037-nohermes:8399`（未挂载 `~/.hermes`）`test_503.py` → **6/6 PASS**（status available:false / profiles 503 / 建 hermes agent 400 / custom 对话正常非降级），结果 `05-temp/t037/test_503_result.json`。
+- **AC-H9 密钥脱敏**：`check_h9.py` 扫描 3 容器日志 + 全部自测产物 JSON + show 响应 raw 段 → **0 处明文密钥**（PASS）。
+- **pytest 回归对照（custom 零回归佐证）**：tests/ 套件硬编码对运行中 8099 服务做集成测试（conftest BASE=localhost:8099），无法直接指向本分支——改用同套件分别打**本分支 t037-sqlite:8499 新卷**与 **1.3.0 基线 t037-baseline:8598 新卷**：两者均 **21 passed / 1 failed**，失败项完全相同（`test_chat_semantic_cache_hit`：首问 llm_calls=0，语义缓存误命中）。该失败在 1.3.0 基线上同样复现 = **既有环境态 flake（本地确定性 embedding + 远程 LLM 缓存交互），非本卡回归**；本卡 diff 不含 agent_engine.py / cache_router.py / 前端，custom 链路零改动。
+- 证据索引：`05-temp/t037/`（t037_selftest.py / clean_t037.py / test_503.py / check_h9.py / launch_t037.py / result_sqlite.json / result_pg.json / test_503_result.json / healthz_*.json / pg_restore.sql / t037-sqlite-data/ / nohermes-data/ / pytest-fresh/ / baseline-data/）。
+- 测试容器 t037-sqlite/t037-pg/t037-nohermes（+ t037-pytest:8499 / t037-baseline:8598）**保留至 TASK-039 回归**（非生产、非 compose、非常驻），台账已登记。
+
+## 4. 给 TASK-038（前端）/ TASK-039（云天明回归）的提示
+
+- 前端探测端点 `GET /api/hermes/status`（登录即可）：`available:false` 时创建页不显示 hermes 选项。
+- hermes agent 创建顺序：先 `POST /api/hermes/profiles`，再 `POST /api/agents`（name 必须 == profile 名，否则 400）。
+- 回归重点：AC-H4 custom 零回归（本卡 diff 不含 `agent_engine.py`/`cache_router.py`/前端）；AC-H9 注意 `GET /api/hermes/profiles/{name}` 的 `raw` 字段是 `profile show` 原文（已脱敏）——`profile show` 本身不打印 `.env` 密钥，脱敏是双保险。
+- 已知限制：hermes 对话每轮新 session（无多轮连贯）；`-z` 无真实 token 流（整段一次发）。
+
+## 5. 纪律自检
+
+- RISK-015：测试容器一律 docker run 隔离（t037-sqlite/t037-pg/t037-nohermes），未起项目 compose 同名容器，未动 8099 线上 ✅
+- DECISION-004：`.env` 不进镜像（.dockerignore），卷挂载风险写入本报告 + README ✅
+- 未 merge main、未部署（TASK-040 范围）✅
+- 临时文件全 `05-temp/t037/`，未用 /tmp ✅
+- 双后端（sqlite + PG 隔离容器）自测 ✅

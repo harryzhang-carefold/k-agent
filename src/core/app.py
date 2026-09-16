@@ -19,10 +19,12 @@ from core.errors import APIError, GraphError
 from core.security import require_perm, current_user
 from core.stats import COUNTERS
 from engine.agent_engine import AgentEngine
+from engine.hermes_adapter import HermesAgentAdapter
 from memory import backend as memory
 from mcp import mcp_client
 from routers.api1 import auth, agents, ext
 from routers.api2 import chat, rag, mem, users, roles, lt, ws_router
+from routers.api_hermes import hermes as hermes_router
 
 app = FastAPI(title="AI Agent Platform", version="1.0.0")
 
@@ -91,6 +93,12 @@ async def startup():
     engine = AgentEngine(app)
     engine.set_conn(conn)
     app.state.engine = engine
+    # 2b. Hermes 适配器（TASK-037 / 需求3）：hermes 后端对话路由。
+    # 与 AgentEngine 并存，按 agent.backend 分派（见 api2.py chat/ws）。
+    # CLI 是否可用在运行期逐次探测（AC-H7 双模式兼容），构造不抛错。
+    hermes_adapter = HermesAgentAdapter(app)
+    hermes_adapter.set_conn(conn)
+    app.state.hermes_adapter = hermes_adapter
     # 3. MCP demo 脚本路径
     mcp_client.set_demo_script(os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -342,6 +350,7 @@ app.include_router(mem)
 app.include_router(users)
 app.include_router(roles)
 app.include_router(lt)
+app.include_router(hermes_router)  # TASK-037: /api/hermes/* profile CRUD + status 探测
 app.include_router(ws_router)
 
 # 静态前端：放在所有 API/WS 路由之后，catch-all 只兜底未匹配路径

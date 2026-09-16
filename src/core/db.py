@@ -121,6 +121,11 @@ async def _pg_init():
             "ALTER TABLE skills ADD COLUMN IF NOT EXISTS updated_at TEXT"
             " DEFAULT (to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS'))",
             "ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS env JSONB DEFAULT '{}'::jsonb",
+            # TASK-037: agents 后端字段（custom|hermes）+ hermes profile 名。
+            # backend 带 NOT NULL DEFAULT 'custom'：旧行自动落到内置引擎（custom），零感知。
+            "ALTER TABLE agents ADD COLUMN IF NOT EXISTS backend TEXT"
+            " NOT NULL DEFAULT 'custom'",
+            "ALTER TABLE agents ADD COLUMN IF NOT EXISTS hermes_profile TEXT",
         ):
             try:
                 await c.execute(ddl)
@@ -197,6 +202,10 @@ async def _sqlite_init():
     for ddl in (
         "ALTER TABLE skills ADD COLUMN updated_at TEXT DEFAULT (datetime('now'))",
         "ALTER TABLE mcp_servers ADD COLUMN env TEXT DEFAULT '{}'",
+        # TASK-037: agents 后端字段（custom|hermes）+ hermes profile 名。
+        # backend NOT NULL DEFAULT 'custom'：旧行自动落 custom（内置引擎），零感知。
+        "ALTER TABLE agents ADD COLUMN backend TEXT NOT NULL DEFAULT 'custom'",
+        "ALTER TABLE agents ADD COLUMN hermes_profile TEXT",
     ):
         try:
             await conn.execute(ddl)

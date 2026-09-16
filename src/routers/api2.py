@@ -46,7 +46,13 @@ async def chat_sync(agent_id: int, body: ChatIn, request: Request,
         await db.execute(conn, "INSERT INTO conversations (id, agent_id) VALUES (?,?)",
                          (conv_id, agent_id))
     history = await _history(conn, conv_id)
-    result = await request.app.state.engine.run(agent, body.message, body.images, history)
+    # TASK-037: 按 backend 分派（custom=内置引擎 / hermes=Hermes CLI）
+    backend = (agent.get("backend") or "custom").lower()
+    if backend == "hermes":
+        engine = request.app.state.hermes_adapter
+    else:
+        engine = request.app.state.engine
+    result = await engine.run(agent, body.message, body.images, history)
     # 持久化消息
     await db.execute(conn, "INSERT INTO messages (conv_id, role, content) VALUES (?,?,?)",
                      (conv_id, "user", body.message or "[image]"))
@@ -101,8 +107,14 @@ async def ws_chat(ws: WebSocket, agent_id: int, conv_id: str):
             text = msg.get("message") or ""
             images = msg.get("images")
             history = await _history(conn, conv_id)
+            # TASK-037: 按 backend 分派（custom=内置引擎 / hermes=Hermes CLI）
+            backend = (agent.get("backend") or "custom").lower()
+            if backend == "hermes":
+                engine = ws.app.state.hermes_adapter
+            else:
+                engine = ws.app.state.engine
             # 流式执行（缓存路由前置；命中直发，否则逐 token）
-            out = await ws.app.state.engine.run_stream(agent, text, images, history)
+            out = await engine.run_stream(agent, text, images, history)
             if out.get("cache_hit"):
                 await ws.send_json({"type": "cache_hit", "content": out["answer"],
                                     "cache_hit": out["cache_hit"],
