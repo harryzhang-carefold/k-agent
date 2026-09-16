@@ -21,7 +21,7 @@ jobs:
           key: ${{ secrets.GCP_SSH_PRIVATE_KEY }}
           script: |
             set -e
-            DEPLOY_DIR="/home/partners/app"
+            DEPLOY_DIR="/home/partners/app/k-agent"
 
             if [ ! -d "$DEPLOY_DIR/.git" ]; then
               echo "Cloning repository..."
