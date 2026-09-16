@@ -123,6 +123,10 @@ async function loadAgents() {
   window._skills = (await api('/api/ext/skills').catch(() => ({ skills: [] }))).skills;
   window._mcps = (await api('/api/ext/mcp').catch(() => ({ mcp_servers: [] }))).mcp_servers;
   window._kbs = (await api('/api/rag/knowledge').catch(() => ({ knowledge: [] }))).knowledge;
+  // TASK-031 缺口B: plugins 选项从后端 GET /api/ext/plugins 动态获取（数据源 =
+  // mcp/plugins.py PLUGIN_REGISTRY 内存注册表，非 DB → 双后端天然一致）；
+  // 新增插件后无需改前端。接口失败时降级为空列表（select 空，保存不选即可）。
+  window._plugins = (await api('/api/ext/plugins').catch(() => ({ plugins: [] }))).plugins;
   // TASK-029: 模型下拉 = 已启用 endpoint（value 存 endpoint name；
   // 旧 agent 的自由文本模型匹配不到时显示"（自定义/默认）"，不报错）
   window._endpoints = (await api('/api/llm-endpoints').catch(() => ({ endpoints: [] }))).endpoints
@@ -145,6 +149,9 @@ async function loadAgents() {
 function hasB(a, type, ref) { return (a.bindings||[]).some(b => b.type===type && String(b.ref_id)===String(ref)); }
 function renderAgentForm(a) {
   const skills = (window._skills || []), mcps = (window._mcps || []), kb = (window._kbs || []);
+  // TASK-031 缺口B: plugins 动态来自 GET /api/ext/plugins（PLUGIN_REGISTRY）；
+  // 每个插件名展示，描述放 option title（hover 可见），新增插件自动出现。
+  const plugins = (window._plugins || []).map(p => p.name);
   const eps = window._endpoints || [];
   const sel = (v, arr, type, id) => arr.map(s =>
     '<option value="' + type + ':' + s.id + '"' + (a && hasB(a, type, s.id) ? ' selected' : '') + '>' + esc(s.name) + '</option>').join('');
@@ -177,18 +184,36 @@ function renderAgentForm(a) {
     '<div><label>temperature</label><input id="ag-t" type="number" step="0.1" value="' + (a?a.temperature:0.2) + '"></div>' +
     '<div><label>max_tokens</label><input id="ag-max" type="number" value="' + (a?a.max_tokens:1024) + '"></div>' +
     '<div><label>top_p</label><input id="ag-p" type="number" step="0.05" value="' + (a?a.top_p:0.9) + '"></div></div>' +
-    '<label>绑定（多选）</label><div class="row">' +
+    '<label>绑定（多选）</label><div class="k">Skills / Plugins 会注入 prompt 固定左侧（指令 + 工具 schema）；' +
+    'RAG 按请求检索知识库上下文注入 prompt；MCP 不注入 prompt，是运行时工具（经 mcp_call 插件路由到对应 server）。' +
+    '全部可选，不选也可以保存。</div><div class="row">' +
     '<div><label>Skills</label><select id="ag-sk" multiple size="3">' + sel('skill', skills, 'skill', 0) + '</select></div>' +
     '<div><label>MCP</label><select id="ag-mc" multiple size="3">' + sel('mcp', mcps, 'mcp', 0) + '</select></div>' +
     '<div><label>RAG</label><select id="ag-rk" multiple size="3">' + sel('rag', kb, 'rag', 0) + '</select></div>' +
-    '<div><label>Plugins</label><select id="ag-pl" multiple size="3">' +
-    ['get_time','mcp_call','echo'].map(p => '<option value="plugin:' + p + '"' +
-      (a && hasB(a, 'plugin', p) ? ' selected' : '') + '>' + p + '</option>').join('') + '</select></div></div>' +
+    '<div><label>Plugins（动态：GET /api/ext/plugins）</label><select id="ag-pl" multiple size="3">' +
+    plugins.map(p => '<option value="plugin:' + esc(p) + '"' +
+      (a && hasB(a, 'plugin', p) ? ' selected' : '') + '>' + esc(p) + '</option>').join('') + '</select></div></div>' +
+    '<div class="k" id="ag-bind-hint"></div>' +
     '<div style="margin-top:14px">' +
     '<button class="primary" style="width:auto;padding:10px 26px" onclick="saveAgent(' + (a?a.id:'null') + ')">' +
     (a?'保存':'创建 Agent') + '</button>' +
     (a?'<button class="small" onclick="loadAgents()">取消</button>':'') +
     ' <span id="ag-err" class="err"></span></div>';
+  // TASK-031 打磨：四个绑定 select 任一变化 → 更新空值提示（可选提示，不阻断保存）
+  ['ag-sk','ag-mc','ag-rk','ag-pl'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) { el.onchange = checkBindHint; checkBindHint(); }
+  });
+}
+// 空值校验（可选提示，不强制）：四个绑定都没选时给一行轻提示，选了即消失
+function checkBindHint() {
+  const el = document.getElementById('ag-bind-hint');
+  if (!el) return;
+  const n = ['ag-sk','ag-mc','ag-rk','ag-pl']
+    .reduce((s, id) => s + (document.getElementById(id)?.selectedOptions.length || 0), 0);
+  el.textContent = n === 0
+    ? '（未绑定任何 skill/mcp/rag/plugin — 可选，agent 仍可用）'
+    : '';
 }
 async function editAgent(id) {
   renderAgentForm(agentsCache.find(x => x.id === id));

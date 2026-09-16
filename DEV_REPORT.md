@@ -1197,3 +1197,117 @@ const list = $('#sk-list'); if (list) list.innerHTML = _skillListHTML(canManage(
 | `shots/01~04_*.png` | 桌面 MCP/长文本 tooltip + 移动端两例 + 整页基线 |
 | `t030.env` | 隔离容器 env（sqlite，dummy LLM key——UI tooltip 自测无需真实 LLM） |
 | `data/` | 隔离容器 sqlite 数据目录（一次性自测，不复用） |
+
+# TASK-031 交付记录：需求4 — Agent 绑定 skill/mcp/rag/plugins 端到端验证 + plugins 动态下拉（2026-09-16，章北海，t_6c74bc7d）
+
+> 分支：`feat/ui-iter2`（接 TASK-030 4991c9c，本卡全部提交在此分支）。
+> 任务书：`~/hermes-workspace/shared/tasks/T-AGP-UI-ITER2.md` §需求4。本卡**不部署**（部署归 TASK-033）。
+> 本卡是 4 项需求中**开发最后一张卡**：feat/ui-iter2 工作树 clean，4 项需求代码全部就绪，下游 TASK-032（云天明回归）直接可测。
+
+## 1. 实现说明
+
+任务书已明确"该功能已基本存在，本卡 = 验证 + 补齐缺口 + 打磨"。勘察结论：
+
+- **后端 `GET /api/ext/plugins` 已存在**（`src/routers/api1.py:182-184`）：返回 `PLUGIN_REGISTRY`（`src/mcp/plugins.py:12`）全部插件的 name+description+schema。数据源是**内存注册表而非 DB** → 双后端天然一致，无新表、无 DDL、无向后兼容风险（缺口 B 的后端部分无需新增，本卡核实后直接复用）。
+- **缺口 A（模型下拉）TASK-029 已到位**（`src/static/app.js:156-173`）：本卡 E2E 复核通过（模型为下拉、默认 system-default、旧 agent 回退不报错），未重复开发。
+
+### 缺口 B：plugins 下拉去硬编码（`src/static/app.js`，唯一代码改动）
+
+| 改动 | 位置 | 说明 |
+|---|---|---|
+| `loadAgents()` 拉取 plugins | `app.js:126-129` | `window._plugins = (await api('/api/ext/plugins').catch(...)).plugins`；接口失败降级空列表（select 空、保存不选即可，不阻断表单） |
+| `renderAgentForm()` 动态渲染 | `app.js:152-154,194-196` | plugins select 选项 = `window._plugins.map(p => p.name)`（原 `['get_time','mcp_call','echo']` 硬编码已删除）；选项名与 value 均过 `esc()`；label 标注"（动态：GET /api/ext/plugins）"便于测试定位 |
+| 向后兼容 | 同 | 现有 `bindings:[{type:'plugin', ref_id:'<name>']} 存储格式不变；`_validate_bindings`（`api1.py:66-70`）继续按名校验；已绑定插件在新选项里照常回显 selected |
+
+### 打磨：绑定区说明 + 空值轻提示
+
+- 说明文字（`app.js:187-189`）：一行讲清"Skills/Plugins 注入 prompt 固定左侧（指令+工具 schema）；RAG 按请求检索知识库上下文注入 prompt；MCP 不注入 prompt，是运行时工具（经 mcp_call 插件路由）；全部可选"——与 `agent_engine.assemble()`（`src/engine/agent_engine.py:48-99`）的真实消费行为逐一对齐。
+- 空值校验（`app.js:196,203-214`，`checkBindHint()`）：四个绑定 select 都未选时显示一行轻提示"（未绑定任何 skill/mcp/rag/plugin — 可选，agent 仍可用）"，任一勾选即消失。**不强制、不阻断保存**（任务书"可选提示，不强制"）。
+- 前端零依赖零构建：仅改 `src/static/app.js` 原生 JS，`node --check` 语法通过。
+
+## 2. 端到端验证证据（Playwright，隔离容器 t031-sqlite:8581，sqlite 后端）
+
+自测脚本 `05-temp/t031/ui_test.js`，**19/19 PASS**（`05-temp/t031/ui_results.json`）。流程：
+登录 admin → Agent 构建器 → 核对 plugins 动态下拉 → 新建 t031-e2e 勾选 skill(医疗问答规范)/mcp(demo)/rag(医疗知识库)/plugin(get_time+mcp_call)（Ctrl+click 多选）→ 保存 → 列表回显 5 个绑定 tag → 编辑回显勾选 → 取消 get_time、新增 echo → 再保存 → 回显更新 → prompt 预览核对 → UI Prompt 按钮渲染 → 删除测试 agent 清理。
+
+关键断言（节选，全文见 ui_results.json）：
+
+```
+[PASS] plugins 下拉选项来自后端（3 个） — ["get_time","mcp_call","echo"]
+[PASS] GET /api/ext/plugins 返回 3 插件（sqlite） — ["echo","get_time","mcp_call"]
+[PASS] 绑定区说明文字（哪些注入 prompt/运行时工具） — count=1
+[PASS] 空值提示：未选绑定时出现轻提示 — hint="（未绑定任何 skill/mcp/rag/plugin — 可选，agent 仍可用）"
+[PASS] 模型为下拉且默认 system-default（029 缺口 A 复核） — default=system-default
+[PASS] 列表回显 t031-e2e + 5 个绑定 tag — …mcp:1 plugin:get_time plugin:mcp_call rag:1 skill:1…
+[PASS] 编辑表单回显勾选（1/1/1/2） — {"sk2":["skill:1"],"mc2":["mcp:1"],"rk2":["rag:1"],"pl2":["plugin:get_time","plugin:mcp_call"]}
+[PASS] 再保存后回显：get_time 已取消、echo 已新增 — …plugin:echo plugin:mcp_call…
+[PASS] prompt 预览含 skill 指令 / 含 RAG 上下文 / 含 echo+mcp_call schema 且 get_time 已移除 / 含工具调用协议块
+[PASS] 清理：测试 agent 已删除 — count=0
+```
+
+### prompt 预览片段（`05-temp/t031/prompt_preview_excerpt.txt`，GET /api/agents/5/prompt 真实响应）
+
+```
+你是一名医疗助手。
+
+[Skills 指令]
+## 医疗问答规范
+回答医疗问题时遵循以下规范：先给出结论，再列依据；涉及检验指标必须标注数值与单位；不确定时明确说明需进一步检查。
+[可用工具 schema]
+[{"name": "echo", ...}, {"name": "mcp_call", "description": "调用 agent 绑定的 MCP server 工具（name=工具名）", ...}]
+
+[工具调用协议]
+你可以调用以下工具。需要调用时，回复一个 JSON … {"tool_call": {"name": "<工具名>", "arguments": {...}}}
+
+[RAG 知识库上下文]
+知识库检索上下文（top-k，按相似度降序）：
+[0] 患者：王建国（P001），男，52岁，因"反复喘息、气促2年，加重1周"就诊。
+诊断：支气管哮喘（中重度，控制不佳）。2026-09-09 门诊：… FEV1 改善量 240 ml …
+```
+
+**证据链闭环**：绑定（skill/mcp/rag/plugin）→ 落库（agent_bindings）→ 引擎 `assemble()` 真实消费（skill 注入 `[Skills 指令]`、plugin 注入 `[可用工具 schema]`、RAG 注入 `[RAG 知识库上下文]`）→ 编辑再保存后 get_time 从 schema 消失、echo 出现（持久化与消费同步正确）。
+
+### plugins 动态化验证（硬约束 5：加测试插件→前端自动出现→测毕复原无残留）
+
+`05-temp/t031/verify_dynamic_plugins.sh`，4 步全 PASS：
+
+1. `docker cp` 临时替换容器内 `/app/mcp/plugins.py`（追加 `t031_temp_test` 注册项，`plugins_patched.py`）→ 重启容器；
+2. `GET /api/ext/plugins` 返回 4 个（含 t031_temp_test）→ `evidence_api_with_temp_plugin.json`；
+3. Playwright 打开 Agent 表单，plugins select **不改前端代码自动出现 t031_temp_test** → `shots/06_plugins_temp_plugin_in_frontend.png`；
+4. 从原始镜像重建容器 → API 恢复 3 个插件、`t031_temp_test` 无残留（`evidence_api_after_restore.json`）。
+
+## 3. 双后端验证（硬约束 1）
+
+`GET /api/ext/plugins` 双后端各验一次（均为 200，数据来自内存 registry、与 DB 无关）：
+
+| 后端 | 容器 | 端口 | 结果 | 证据 |
+|---|---|---|---|---|
+| sqlite | t031-sqlite | 8581 | 200, 3 插件（get_time/mcp_call/echo） | `05-temp/t031/evidence_api_plugins_sqlite.json` |
+| postgres（pg-unified:agp） | t031-pg | 8681 | 200, 3 插件（同上） | `05-temp/t031/evidence_api_plugins_pg.json` |
+
+PG 容器 seed 幂等性：`pg_snap.py before/after` 18 张表行数逐一比对**完全一致**（`pg_baseline.txt`/`pg_after.txt`），pg-unified:agp 无新增无变更，无需复原。
+
+## 4. 截图索引（`05-temp/t031/shots/`）
+
+| 文件 | 内容 |
+|---|---|
+| `01_agents_form_plugins_dynamic.png` | Agent 表单：plugins 动态 label、绑定区说明文字、空值提示 |
+| `02_agents_form_selected.png` | 新建 t031-e2e：四类绑定已勾选（skill/mcp/rag/2 plugins），模型=system-default |
+| `03_agents_list_created.png` | 列表回显 5 个绑定 tag |
+| `04_agents_list_edited.png` | 编辑再保存后回显（get_time 已取消、echo 已新增） |
+| `05_prompt_preview.png` | UI Prompt 按钮渲染的组装 prompt（含 Skills 指令/工具 schema/RAG 上下文） |
+| `06_plugins_temp_plugin_in_frontend.png` | 临时测试插件 t031_temp_test 自动出现在前端 select（动态化铁证） |
+| `prompt_preview.json` / `prompt_preview_excerpt.txt` | GET /api/agents/{id}/prompt 完整响应 + 关键片段 |
+
+## 5. 自测环境与纪律（RISK-015）
+
+- 隔离容器 `t031-sqlite:8581`（sqlite 新卷）+ `t031-pg:8681`（连 pg-unified:agp），`docker run` 独立命名/端口，**全程未碰 8081 网关 / 8099 线上 agp-app / 哮喘 / gw-nginx**；密钥走 `--env-file`（0600），未进命令行。
+- 镜像 `agp-platform:t031`：以 t030 镜像为 base 仅 `COPY src/static /app/static`（本卡改动全在静态层），后端代码零改动。
+- **本卡不部署**：线上 agp-app(1.2.0-dual) 未动；部署归 TASK-033（镜像 tag 递增 + 4 需求线上 E2E）。
+
+## 6. 给 TASK-032（云天明回归）/ TASK-033（部署）的提示
+
+1. 本卡改动仅 `src/static/app.js`（+73/-11 行级）：回归面 = Agent 构建器页（plugins 下拉/绑定说明/空值提示/保存回显）+ 模型节点页与 MCP-Skills 页不受影响。
+2. 回归时若用 `<select multiple>` 自动化，注意 **Ctrl+click 才是多选语义**（纯 click 是替换选择）——自测脚本已按此实现。
+3. 线上部署后核对：Agent 表单 plugins 下拉 3 项（get_time/mcp_call/echo）来自 `GET /api/ext/plugins`（线上当前与源码一致，registry 未变）；新增插件后前端自动出现（本卡已用临时插件验证）。
+4. 测试 agent 已清理（sqlite 卷随容器删除）；pg-unified:agp 数据零变更（18 表行数 before/after 一致）。
