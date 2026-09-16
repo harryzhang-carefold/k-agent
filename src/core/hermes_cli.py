@@ -6,15 +6,21 @@
 password/secret 的值 → 末 4 位掩码），绝不把明文密钥写进 API 响应或日志。
 """
 import asyncio
+import logging
 import os
 import re
 import shutil
 import subprocess
 from pathlib import Path
 
+logger = logging.getLogger(__name__)
+
 _HERMES_BIN = "hermes"
 _TIMEOUT = 60.0  # 任务书：profile 命令统一 60s
 _PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+# `hermes profile list` 中 active（运行中）profile 行带此前缀标记
+# （U+25C6 BLACK DIAMOND "◆"），且该前缀使行前导只剩 1 个空格。
+_ACTIVE_MARK = "◆"
 
 # AC-H9：含这些子串的行，等号后的值一律脱敏
 _SECRET_KEY_RE = re.compile(
@@ -345,25 +351,43 @@ async def create_profile(name: str, description: str | None = None,
             "model_configured": _profile_has_model(name)}
 
 
-async def list_profiles() -> list[dict]:
-    """`hermes profile list` 表格输出 → [{name, model, gateway, alias, distribution}]。"""
-    out = await _run(["profile", "list"])
+def _parse_profile_list(out: str) -> list[dict]:
+    """解析 `hermes profile list` 表格输出 → [{name, model, gateway, alias, distribution}]。
+
+    BUG-008 修复（TASK-041）：原实现用 `^\\s{2,}(\\S+)\\s{2,}` 匹配数据行，
+    依赖"name 之后至少 2 个分隔空格"。但 `profile list` 是固定/自适应列宽
+    表格——name ≥15 字符时 name 与 model 之间**只剩 1 个分隔空格** → 匹配
+    失败 → 该 profile 被 `continue` **静默丢弃**（API 不可见但数据真实落地）。
+    且 active（运行中）profile 行带 `◆` 前缀使行前导只剩 1 个空格，原正则
+    `\\s{2,}` 同样丢它。
+
+    改为**按空白切 token、不依赖固定列宽 / 分隔空格数量**：
+      - 首 token 必须匹配 `_PROFILE_RE`（合法 profile 名）且行至少有
+        name+model 两个 token，否则判为表头/分隔线/说明行，跳过；
+      - active 行的 `◆` 前缀在切词前剥离；
+      - 看起来像数据行（首 token 是合法名）却缺必需列 → **logging.warning**
+        告警（杜绝再次静默丢弃，本 BUG 最恶劣的部分）。
+    """
     rows: list[dict] = []
-    for line in out.splitlines():
-        # 数据行：以 2 空格 + 名字开头；名字后至少 2 列
-        m = re.match(r"^\s{2,}(\S+)\s{2,}", line)
-        if not m:
+    for line in (out or "").splitlines():
+        if not line.strip():
             continue
-        name = m.group(1)
-        if name in ("default",) or not _PROFILE_RE.match(name):
-            # default 也是合法 profile，但表头/分隔行不含；保留 default
-            if not _PROFILE_RE.match(name):
-                continue
-        parts = line.split()
-        # 行格式：name model gateway alias distribution（alias/distribution 常为 —）
-        rec = {"name": name}
-        if len(parts) > 1:
-            rec["model"] = parts[1]
+        # active 标记（◆）只可能出现在数据行首，剥离后不影响 token
+        parts = line.strip().lstrip(_ACTIVE_MARK).split()
+        if not parts:
+            continue
+        first = parts[0]
+        if not _PROFILE_RE.match(first):
+            # 表头（Profile…）/ 分隔线（─…）/ 其它非数据行：首 token 不是
+            # 合法 profile 名，静默跳过（无信息可告警）。
+            continue
+        if len(parts) < 2:
+            # 首 token 是合法 profile 名却没有 model 列 → 疑似被截断/变形的
+            # 数据行，绝不能静默丢（BUG-008 根因）。
+            logger.warning("hermes profile list 行解析失败（疑似数据行缺列）: %r", line)
+            continue
+        rec: dict = {"name": first}
+        rec["model"] = parts[1]
         if len(parts) > 2:
             rec["gateway"] = parts[2]
         if len(parts) > 3:
@@ -372,6 +396,12 @@ async def list_profiles() -> list[dict]:
             rec["distribution"] = None if parts[4] in ("—", "-", "") else parts[4]
         rows.append(rec)
     return rows
+
+
+async def list_profiles() -> list[dict]:
+    """`hermes profile list` 表格输出 → [{name, model, gateway, alias, distribution}]。"""
+    out = await _run(["profile", "list"])
+    return _parse_profile_list(out)
 
 
 async def show_profile(name: str) -> dict:

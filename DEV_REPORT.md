@@ -1677,3 +1677,90 @@ DELETE FROM agp.conversations WHERE id IN ('c10bc0e23b248','caa33a8ce9d04','cdf0
 - 范围控制：不做 profile 独立管理页（表单内嵌下拉+新建）、不做 hermes agent 工具注入（任务书 §六）✅
 - 不 merge main、不部署 ✅
 - 临时文件全 `05-temp/t038/`，未用 /tmp ✅
+
+---
+
+# TASK-041 · 修复 BUG-008：`hermes profile list` 长名（≥15 字符）profile 被 API 静默丢弃（2026-09-17，章北海，t_c7d6aaa2）
+
+## 1. 根因（TASK-040 褚岩独立终审已坐实，本卡复现确认）
+
+`src/core/hermes_cli.py:354`（TASK-037 提交 268af6a 引入）：
+```python
+m = re.match(r"^\s{2,}(\S+)\s{2,}", line)
+if not m:
+    continue      # 不匹配 → 整行静默丢弃（无日志/无告警）
+```
+- `hermes profile list` 是**列宽自适应表格**：name 列前导 2 空格 + 左对齐 16 列宽（止于第 18 列），name 更长时列宽**自适应撑开**、name 与 model 间**只剩 1 个分隔空格**。
+- 旧正则 `\s{2,}` 要求 name 后 **≥2 个分隔空格** → name 长度 ≥15 时匹配失败 → 该 profile 从 `GET /api/hermes/profiles` 响应中**静默消失**（数据真实落地但 API 不可见）。len 10~14 正常、len 15~20 全丢（褚岩 len 10→20 全扫描坐实，本卡宿主 `hermes profile list` 复现）。
+- **附带发现（本卡独立证实）**：active（运行中）profile 行带 `◆`（U+25C6）前缀且**行前导只剩 1 个空格**（`◆zhangbeihai`），旧正则 `\s{2,}` 要求 ≥2 前导空格 → **active 行同样被静默丢弃**。本卡宿主 list 实测：旧代码只解析出 17 行，`◆zhangbeihai`（当前 running profile）不在其中。
+
+> 任务书建议的"按列起点切分（model 起第 21 列）"经实测**不可靠**：CLI 对长 name 是**列宽自适应撑开**（len=16→model 起 19 列、18→21、19→22、20→23），并非固定第 21 列。故采用任务书给的**另一选项——按空白切 token 的宽松匹配**，不依赖任何固定列宽/分隔空格数量，对 CLI 版本漂移（RISK-021）更稳。
+
+## 2. 修复方案（最小改动，仅动 `src/core/hermes_cli.py`）
+
+1. **抽出纯函数 `_parse_profile_list(out: str)`**（原 `list_profiles` 内联逻辑搬出）：`list_profiles()` 保持 `await _run(["profile","list"])` 后直接调它。抽出为纯函数使表格解析可脱离 hermes CLI 单测（任务书要求对假行断言）。
+2. **按空白切 token，不依赖固定列宽 / 分隔空格数量**：
+   - `line.strip().lstrip("◆").split()` —— 先剥 active 标记（`◆`）再切词；
+   - 首 token 必须匹配既有 `_PROFILE_RE`（合法 profile 名 `[a-z0-9][a-z0-9_-]*`），否则判为表头/分隔线/说明行跳过（表头首 token `Profile`、分隔线首 token `─…` 均不匹配 → 天然跳过）；
+   - 行至少要有 name+model 两个 token 才算数据行；
+   - model/gateway/alias/distribution 取第 2/3/4/5 token，em-dash（`—`，非 `-`）/空 → `None`（与修复前行为一致）。
+3. **对"疑似数据行缺列"加 `logging.warning`，杜绝再次静默丢弃**：首 token 是合法 profile 名却缺 model 列（被截断/变形的数据行）→ `logger.warning("hermes profile list 行解析失败（疑似数据行缺列）: %r", line)` 后跳过。这是本 BUG 最恶劣部分（数据落地但 API 不可见）的兜底——今后任何解析失败都留痕。
+4. **`show_profile()` 确认不受同类列宽影响**（任务书要求 3）：`profile show` 输出是 **key:value 非表格**（`Profile: …` / `Path: …` / `Gateway: …`），解析按 `line.partition(":")` 逐行取 key，与列宽/分隔空格数量无关 → **不受 BUG-008 同类问题影响**（已代码确认 + 宿主 `profile show <长名>` 实测输出格式）。
+5. **不引入 `shell=True`**（保持 `asyncio.create_subprocess_exec`）、**脱敏（AC-H9）与 503 降级（AC-H7）行为不变**（`_redact`/`hermes_bin`/`_run` 路径零改动，仅 list 解析内部逻辑变更）。
+
+## 3. 单测证据（新增 `tests/test_hermes_profile_list.py`，11 用例全绿）
+
+纯函数单测，不依赖 hermes CLI / 不起子进程 / 不连服务（与既有 pytest 一致：src 入 sys.path）。假行布局按真实 CLI 规则生成（name 列 = 2 空格 + 左对齐 16 列宽，name→model 分隔 = `max(1, 16-len)`：len≤14 为 ≥2 空格、len≥15 为 1 空格）。
+
+```
+tests/test_hermes_profile_list.py::test_longname_rows_parsed[14] PASSED
+tests/test_hermes_profile_list.py::test_longname_rows_parsed[15] PASSED
+tests/test_hermes_profile_list.py::test_longname_rows_parsed[16] PASSED
+tests/test_hermes_profile_list.py::test_longname_rows_parsed[20] PASSED
+tests/test_hermes_profile_list.py::test_single_space_separator_len15 PASSED
+tests/test_hermes_profile_list.py::test_fixed_width_two_spaces_len14_no_regression PASSED
+tests/test_hermes_profile_list.py::test_active_profile_marker PASSED
+tests/test_hermes_profile_list.py::test_header_separator_blank_skipped PASSED
+tests/test_hermes_profile_list.py::test_em_dash_and_alias_values PASSED
+tests/test_hermes_profile_list.py::test_missing_column_warns_not_silent PASSED
+tests/test_hermes_profile_list.py::test_old_regex_would_drop_len15_regression_evidence PASSED
+============================= 11 passed in 15.21s =============================
+```
+
+覆盖点：
+- **回归护栏**：len=14/15/16/20 假行（阈值正好跨 14→15）均被正确解析成 profile 记录（name/model/gateway/alias/distribution 全对）。
+- len=15 单空格分隔（真实触发形态）解析成功；len=14 双空格（既有正常形态）**不回归**。
+- **active（`◆`）行**解析成功（剥 `◆` 后 name 正确）——修掉旧正则的另一处静默丢弃。
+- 表头 / `─` 分隔线 / 空行被跳过，不误报为数据行。
+- em-dash（`—`）alias/distribution → `None`；有值 alias 原样保留。
+- 疑似数据行缺列 → `logging.warning` 产生（caplog 断言），不静默丢弃。
+- 回归证据用例：断言**旧正则** `^\s{2,}(\S+)\s{2,}` 对 len=15 行 `re.match` 返回 `None`（锁定"旧实现确实会丢"这一事实，防未来把宽松匹配改回 ≥2 空格）。
+
+## 4. 真实 CLI 端到端复现（宿主 `hermes profile list`，非 mock）
+
+临时创建 len=14/15/16/18/19/20 的 profile（`t041x…`），对**真实** `hermes profile list` 输出跑新旧解析：
+- **旧（修复前）正则**只解析出 **17** 个 profile —— `t041xxxxxxxxxxx`(15)/`…16/18/19/20` 与 `◆zhangbeihai`（active）共 **6 行被静默丢弃**（复现 BUG-008）。
+- **新解析器**解析出 **23** 个 —— 长名 14~20 全在 + active 行在，name/model/gateway/alias 字段逐条正确。
+- 验证后已 `hermes profile delete` 清理全部 6 个 `t041*` 临时 profile（宿主 list 已恢复 0 个 t041 残留）。
+
+## 5. 部署
+
+- **本卡不部署、不构建镜像、不 merge main**（TASK-041 任务书明确；部署 1.4.0 是下游 TASK-043）。
+- 改动仅 `src/core/hermes_cli.py`（后端解析逻辑）+ 新增 `tests/test_hermes_profile_list.py`（单测），无 Dockerfile/compose/端口/卷变更 → **无台账（SERVER_REGISTRY.md）变更**。线上 8099（1.3.0）未触碰。
+
+## 6. 给 TASK-042（云天明回归）的提示
+
+- 重点：**长名 profile（≥15 字符，建议 15/16/20 三档）专项** —— `POST /api/hermes/profiles` 创建 → `GET /api/hermes/profiles` 必须可见（AC-H1）→ 前端下拉可选（AC-H8）→ 全流程 create-agent/badge/edit/delete 走通。
+- **active profile 可见性**：确认当前 running 的 profile（带 `◆` 行）在 list 中出现（旧代码此处也丢，本次一并修复）。
+- 双后端（sqlite + PG）均验证 list 长名可见（解析为 CLI 宿主侧行为，理论双端一致，但请双端各跑一遍）。
+- 既有 AC-H1~H9 重跑确认无回归；CLI 缺失 503（AC-H7）与脱敏（AC-H9）行为未变（本卡零改动该路径）。
+- 容器起法遵守 RISK-015（docker run 隔离，禁项目 compose 同名容器）。
+
+## 7. 纪律自检
+
+- 改代码前已读 STATUS.md / PLAN（任务书卡体）/ BUGS.md BUG-008 全量上下文 ✅
+- 最小改动：仅 `hermes_cli.py` list 解析（+15/-15 行净逻辑）+ 新增 1 个单测文件，零重构无关代码 ✅
+- 不引入 `shell=True`；脱敏/503 降级路径零改动 ✅
+- 临时文件全 `05-temp/t041/`（探针脚本 + pytest 日志），未用 /tmp ✅
+- 不部署/不构建/不 merge main ✅
+- 宿主侧验证用真实 CLI（非 mock），验证后已清理全部临时 profile ✅
