@@ -2050,7 +2050,7 @@ to create or update workflow `.github/workflows/deploy.yml` without `workflow` s
 | AC-2 deploy.yml 含 DB 决策 + 健康检查 + 失败诊断 | ✅ 满足 | 静态审查确认齐备（探测/复用/自建幂等 + 健康检查 + 诊断 + fail-fast + AGP STARTUP OK） |
 | AC-3 push main 后 CI 完成 + 8099 healthz 200 | 🔴 **FAIL（push ✅ / CI ❌）** | push 已落地（origin/main=785818c）；CI Run 35226142403 = failure（SSH 部署步骤）；8099 实测仍 000。失败根因日志 403 读不到 → 需用户查看 |
 | AC-4 GCP docker ps agp-app healthy 无 restart 循环 | 🔴 **FAIL（GCP 未生效）** | 1.5.0 未部署到 GCP（CI 失败）；8099 持续 000 |
-| AC-5 文档（DEV_REPORT §TASK-051 + README + compose tag 1.5.0） | ✅ 满足 | 本 §；README 部署章节（默认 sqlite + postgres 策略）TASK-048 已更新（无回退）；compose `image: agp-platform:1.5.0`（main @ 68cf7e6 在位） |
+| AC-5 文档（DEV_REPORT §TASK-051 + README + compose tag 1.5.0） | ✅ 满足 | 本 §；README 部署章节（默认 sqlite + postgres 策略）TASK-048 已更新（无回退）；compose `image: agp-platform:1.5.0`（origin/main @ 785818c 在位） |
 | AC-6 本地 1.3.0/1.4.0 线上服务不受影响 | ✅ 满足 | 全程 + 收尾 agp-app(1.4.0)/pg-unified/gw-nginx 均 healthy，8099=200 / 8081=200 |
 
 ### 5. 交付状态
