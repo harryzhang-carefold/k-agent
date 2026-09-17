@@ -294,18 +294,29 @@ else
   fi
 
   # ---- 有效 DSN 写回 .env（覆盖 ENV_FILE 旧值；DB_DSN 置空避免旧 DSN 生效）----
-  # 关键：DB_HOST 必须写"容器实际网络 IP"而非容器名——容器名 DNS 只在同一
-  # 网络内解析，复用外部 PG 容器（agp-pg 或别的 postgres 容器）时 app 默认
-  # bridge 网络可能解析不了容器名（跨网络 DNS 不互通）。容器 IP 对宿主全局
-  # 可路由，app 经 bridge NAT 可达，最稳健。
-  EFF_HOST="$decide_ds"
-  if [ "$EFF_HOST" != "127.0.0.1" ] && [ -n "$EFF_HOST" ] && docker inspect "$EFF_HOST" >/dev/null 2>&1; then
-    CONT_IP="$(docker inspect "$EFF_HOST" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' | awk '{print $1}')"
-    if [ -n "$CONT_IP" ]; then
-      log "容器 $EFF_HOST 网络 IP = $CONT_IP（DSN 用 IP，跨网络可达）"
-      EFF_HOST="$CONT_IP"
-    fi
+  # 容器方案（BUG-009 修复，TASK-049）：DB_HOST 写"容器名"而非容器 IP。
+  # 旧版写 container_ip()（Go map 乱序取首项网络 IP）有两个致命问题：
+  #   1) 抓 IP 发生在 docker network connect agp_default 之前，自建场景容器
+  #      只有 bridge 网 → DSN 写 bridge IP（172.17.0.x），app 在 agp_default
+  #      连 bridge IP 不可达 → fail-fast 重启循环（GCP 8099 部署后依旧不通）；
+  #   2) 容器多网络时 map 乱序取首项，取到哪个 IP 随机（flaky）。
+  # 现改为：先把 PG 容器加入 agp_default（下方 case 块），app 经 compose 叠加
+  # 也在 agp_default → Docker 内置 DNS 按容器名解析，跨重连/重启稳定，无乱序。
+  # 127.0.0.1 复用分支保持宿主内网 IP 路径（app 不在宿主 netns，不能用 127.0.0.1）。
+  if ! docker network inspect agp_default >/dev/null 2>&1; then
+    docker network create agp_default >/dev/null
   fi
+  case "$PG_CRED_HOST" in
+    agp-pg|agp-pg\(created\)|container:*)
+      docker network connect agp_default "$decide_ds" 2>/dev/null || true
+      log "PG 容器 $decide_ds 已加入 agp_default（app 按容器名解析）"
+      ;;
+    localhost)
+      log "127.0.0.1 复用：app 经 bridge 直连宿主内网 IP（需该 PG 在宿主 5432 监听）"
+      ;;
+  esac
+
+  EFF_HOST="$decide_ds"
   if [ "$EFF_HOST" = "127.0.0.1" ]; then
     HOST_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
     if [ -n "$HOST_IP" ]; then
@@ -321,28 +332,6 @@ else
   env_set DB_SCHEMA "$DB_SCHEMA_VAL"
   env_set DB_DSN ""
   log "DSN 已写入 .env: host=$EFF_HOST port=$DB_PORT_VAL user=$DB_USER_VAL db=$DB_NAME_VAL schema=$DB_SCHEMA_VAL（密码不回显）"
-
-  # ---- 网络：让 app 能按容器名/内网 IP 到达 PG ----
-  # 容器名 DNS 只在容器网络内解析。最稳健做法：把 PG 容器加入 agp_default
-  # （app 经 .compose.agp-net.yml 也在该网络），app 用容器名即可解析。
-  # 容器 IP 对宿主全局可路由，所以"任意网络上的容器"都可达，无需改网络。
-  if ! docker network inspect agp_default >/dev/null 2>&1; then
-    docker network create agp_default >/dev/null
-  fi
-  case "$PG_CRED_HOST" in
-    agp-pg|agp-pg\(created\))
-      docker network connect agp_default "$PG_CONTAINER" 2>/dev/null || true
-      log "agp-pg 已加入 agp_default（app 按容器名解析）"
-      ;;
-    container:*)
-      # 复用外部 PG 容器：加入 agp_default（不改它原有网络，只追加）
-      docker network connect agp_default "$decide_ds" 2>/dev/null || true
-      log "复用容器 $decide_ds 已加入 agp_default（app 按容器名解析）"
-      ;;
-    localhost)
-      log "app 经 bridge 直连宿主内网 IP（$EFF_HOST）；需该 PG 在宿主 5432 监听"
-      ;;
-  esac
 fi
 
 # ---------------------------------------------------------------------------
