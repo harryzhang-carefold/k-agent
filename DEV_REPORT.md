@@ -1834,3 +1834,66 @@ GCP 现象（编排方实测）：8099 TCP 可连但 HTTP 空响应（Empty repl
 - 未 push、未部署线上、未动本机 agp-app(1.4.0)/gw-nginx/pg-unified（测试全程 docker run 隔离，测后已清理全部 t046-* 容器）✅
 - 密钥纪律：ENV_FILE 内容永不回显（heredoc 600 临时文件 + trap 即删）；PG 密码只进 .env / docker -e / `.pg_credentials`(600)；fail-fast 日志只打 host:port/db ✅
 - 临时文件全在 `05-temp/t046/`，未用 /tmp ✅
+---
+
+## TASK-048 · PM 黑盒终审 + 交付判定（褚岩 · 2026-09-17 · t_a401f651）
+
+> 卡C 终审：独立黑盒（不采信卡A 自测 / 卡B 回归），静态审查 deploy.yml + gcp_deploy.sh + db.py 全量逻辑，本地 RISK-015 隔离容器场景抽验（T1/T3/T4 + 修复方向对照），判定闸门 → push 决策。
+
+**判定：FAIL（P0=1，BUG-009 独立确认）→ 不 push main，回派章北海修复。**
+
+### 1. 终审方法（独立黑盒）
+
+- **被测对象**：`feat/gcp-fix-150` @ `d5ecd46`（TASK-046 终版）。从 `git archive d5ecd46` 干净上下文**独立重建镜像 `agp-platform:1.5.0-t048`**（与卡B t047 镜像独立，互不依赖）。
+- **沙箱**：`05-temp/t048/`（bare repo `origin.git` 沙箱 main = d5ecd46 + **2 行 RISK-015 守卫**：`agp-pg→t048-pg` 避免与线上 PG 重名误伤 + `pg_isready` 改容器内自测避免误探本机线上 pg-unified:5432；隔离 compose 端口 8399 / 容器名 t048-app / 去 hermes 挂载）。真实 `gcp_deploy.sh` 逻辑 100% 原样执行。
+- **线上核验**（全程 + 收尾）：agp-app 1.4.0 healthy / pg-unified healthy / gw-nginx healthy / 本地 8099 healthz=200 / 无遗留 t048-* 或 agp-pg 容器。
+
+### 2. 静态审查结论（deploy.yml / gcp_deploy.sh / db.py）
+
+| 审查项 | 结论 |
+|---|---|
+| DB 决策默认 sqlite | ✅ 无 DB_BACKEND 或 =sqlite → 写 sqlite 跳过探测（L114-116）；非法值 exit 1（L118-121） |
+| postgres 探测→复用→自建 | ✅ agp-pg（CREDS_FILE 凭据）→ 其他 postgres 容器 → 127.0.0.1:5432 三级探测（L173-254）；复用档位 ok/login 判定 + ensure_db 建库建 schema |
+| 自建幂等 | ✅ 已存在 agp-pg → a(1) 复用不重建；密码 ENV_FILE 有则用/无则生成持久化 `.pg_credentials` 600（L257-294） |
+| 健康检查 + 失败诊断 | ✅ 120s 轮询 healthz；失败打印 logs --tail 100 + ps -a + restart 计数后 exit 1（L389-421） |
+| 卷属主防御 | ✅ chown 1000:1000 + chmod 777 兜底（L349-357） |
+| hermes 挂载 1.4.0 行为 | ✅ compose 维持 1.4.0 挂载；未挂载环境 503 降级（T6 已验） |
+| app fail-fast（db.py） | ✅ PG 启动探测 10s（<15s）超时/失败 → RuntimeError 明确日志退出（L124-163）；sqlite 目录不可创建/不可写/落盘写失败 → 明确报错（L260-286）；`AGP STARTUP OK` 就绪标记（app.py L118） |
+| **BUG-009（P0）** | 🔴 **DSN 写 bridge IP 缺陷确认**：`gcp_deploy.sh` L301-308 在 `docker network connect agp_default`（L325-345）**之前**用 `docker inspect ... Networks` range 取首项 IP（Go map 乱序），自建场景此时容器只挂 bridge → DSN 写 bridge IP（172.17.0.x）；app 经 compose 叠加在 `agp_default`，连 bridge IP 不可达（跨网络路由不通）→ fail-fast 重启循环 → **GCP 8099 部署后依旧不通**。复用分支（a(1)/a(2)）同样隐患（复用后 agp-pg 已 connect 网络，但 map 乱序仍可能取错网络） |
+
+### 3. 本地场景抽验（隔离容器证据，`05-temp/t048/`）
+
+| 场景 | 结果 | 证据 |
+|---|---|---|
+| **T1 sqlite 默认** | ✅ PASS | `t1_healthz.txt`：健康检查通过，healthz 200 `db.backend=sqlite`，种子 graph_nodes=7/edges=8 |
+| **T3 干净自建 ×3** | 🔴 **FAIL 3/3（BUG-009 独立复现）** | `s1_summary.txt`：run1/2/3 全部 DSN=`172.17.0.4`（bridge IP；t048-pg 实际 networks=[agp_default=172.18.0.9 bridge=172.17.0.4]）→ 健康检查 120s 全失败。与卡B 3/3 复现独立互证 |
+| **T4 fail-fast ≤15s** | ✅ PASS | `s2_evidence.txt`：DB_HOST=192.0.2.1 黑洞 → 时间戳 08:47:29.428 startup → 08:47:39.443 fail-fast = **10.02s 退出**，明确日志 `AGP DB fail-fast: 连接 postgres 超时（>10s） host=... 检查 DB_HOST/...`，不 hang |
+| **对照 A（BUG-009 现状复现）** | 🔴 确认 | `s3_control.txt`：DB_HOST=bridge IP `172.17.0.4`，app 在 agp_default → 10s fail-fast 循环，healthz=000 |
+| **S3 修复方向（DSN=容器名）** | ✅ 有效 | `s3_result.txt`：DB_HOST=`t048-pg` → **healthz 200（~2s）**，`AGP STARTUP OK backend=postgres db=t048-pg:5432/postgres`，数据落 PG（agp schema **22 表** / users=4 / agents=1），restarts=0 |
+| 线上未触碰 | ✅ | `online_check.txt`：agp-app 1.4.0 healthy / pg-unified / gw-nginx 全 healthy / 本地 8099=200 |
+
+### 4. 判定闸门与处置
+
+- **P0=1（BUG-009），P1=0** → 不满足"P0/P1=0 才可 push"闸门 → **不 push main**（若现在 push，GCP CI 会真实执行同一脚本 → 自建 agp-pg 后 DSN=bridge IP → 8099 依旧不通，白烧一次 CI + 污染 GCP 状态）。
+- **回派**：卡A 修复 BUG-009（章北海）→ 卡B 重跑 T3+回归（云天明）→ 本卡重走终审 → PASS 后 push。
+- **修复方向（本卡已独立实测验证，供章北海参考）**：
+  - **首选 A**：`DB_HOST` 直接写**容器名**（`agp-pg`）——脚本已 `docker network connect agp_default`，app 在 agp_default 内按容器名 DNS 解析即可（本卡 S3 实测：2s healthy + 数据落 PG，无乱序问题）。
+  - **备选 B**：把 `docker network connect agp_default` 提到抓 IP 之前 + 显式取 `agp_default` 网络 IP（`docker inspect --format '{{.NetworkSettings.Networks.agp_default.IPAddress}}'`）。
+  - **必须一并覆盖**：复用分支（a(1) agp-pg / a(2) 其他容器，L191/L214 的 probe 与 L301 的 DSN 抓取同链路）+ `127.0.0.1` 复用分支（宿主内网 IP 路径）不受回退影响。
+  - 注意：容器名方案依赖 compose 叠加文件（`.compose.agp-net.yml`）把 app 接进 agp_default——该机制已存在（L362-374），sqlite 模式不叠加、走容器名 DSN 的场景不存在，无影响。
+
+### 5. 交付状态
+
+| AC | 状态 |
+|---|---|
+| AC-1 T1~T7 全 PASS | 🔴 未满足（T3 FAIL，BUG-009） |
+| AC-2 deploy.yml DB 决策 + 健康检查 + 诊断 | 🟡 逻辑齐备，但 DSN 写 IP 缺陷使其在自建场景实际不可用（见 BUG-009） |
+| AC-3 push main + CI + GCP 8099 200 | ⛔ 未执行（闸门未过） |
+| AC-4 GCP docker ps healthy | ⛔ 未执行 |
+| AC-5 文档 | ✅ README 部署章节已更新（默认 sqlite + postgres 策略说明）；compose tag 1.5.0 已在 d5ecd46 内（`image: agp-platform:1.5.0`）；本 § 即 DEV_REPORT 交付部分 |
+| AC-6 本地线上服务不受影响 | ✅ 全程未触碰，收尾核验全 healthy |
+
+**剩余风险（交付用户）**：
+1. **BUG-009（P0，阻塞）**：GCP 8099 修复核心路径（postgres 自建）不可用，待章北海修复 + 回归 + 终审后 push。sqlite 模式路径（T1）已独立验证 OK——**若 ENV_FILE 实际配置为 sqlite，当前版本 push 即可修复 GCP 8099**；但按任务书"postgres 策略必须可用"的验收口径，仍须修复后再 push（ENV_FILE 内容不可见，不假设其值）。
+2. **GCP 现状未变**：34.121.9.233:8099 仍故障（本卡未 push，未触发部署，不擅自触碰 GCP）。CI 上次 success 但应用未起好的盲点已由 1.5.0 健康检查修复，待 push 后生效。
+3. 既有非阻塞风险（RISK-020/021/023 等）见 STATUS.md 阶段六/七遗留清单，本轮无新增。

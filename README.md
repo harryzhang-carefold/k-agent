@@ -186,6 +186,20 @@ tests/           pytest 套件（auth/agents/chat/rag/memory/mcp/longtext/ws）
 
 > **1.5.0 起 GCP 云端部署（CI 自动）走 `scripts/gcp_deploy.sh`**，数据库策略见下方"数据库自动决策（1.5.0）"。本地/手动部署仍用本节 `./deploy.sh`。
 
+### 数据库自动决策（1.5.0，GCP CI 部署）
+
+`push main` → GitHub Actions（`.github/workflows/deploy.yml`）→ SSH 到 GCP VM 执行 `scripts/gcp_deploy.sh`，DB 策略（用户拍板，TASK-046）：
+
+1. **默认 sqlite**：`ENV_FILE` 未配置 `DB_BACKEND` 或 `=sqlite` → 一律 sqlite（零外部依赖，clone 即跑），跳过 DB 探测。
+2. **postgres 模式**（`DB_BACKEND=postgres`）：在 GCP 宿主按序 **探测 → 复用 → 自建（幂等）**：
+   - 探测 `agp-pg`（此前自建，凭据在 `.pg_credentials`）→ 其他 postgres 容器 → `127.0.0.1:5432`；
+   - 可复用（连通 + 认证 + 库存在；库缺失但可登录则自动建库 + `agp` schema）→ 复用，有效 DSN 写 `.env`；
+   - 复用不了/不存在 → `docker run -d postgres:16-alpine` 自建 `agp-pg`（固定名、数据卷持久化、固定用户、密码 ENV_FILE 有则用/无则生成并持久化到 `.pg_credentials` chmod 600，等 `pg_isready` 就绪）；
+   - 重跑 deploy 幂等（`agp-pg` 已存在 → 复用不重建）。
+3. **部署后健康检查**：compose up 后轮询 `/healthz`（≤120s）；失败 → CI 日志输出 `docker logs --tail 100` + `docker ps -a` + restart 次数后 exit 1（CI 日志 = 第一诊断现场）。
+4. **app 侧 fail-fast**：启动连 DB 超时（10s）→ 明确错误日志后立即退出（禁止无限 hang）；sqlite 卷不可写同样 fail-fast（日志指明目录与权限）。
+5. **数据卷属主防御**：up 前 `chown 1000:1000 src/data`（无权限则 `chmod 777` 兜底 + warning）。
+
 ```bash
 cd 02-development
 
