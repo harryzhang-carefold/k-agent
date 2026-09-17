@@ -5,6 +5,24 @@ name: Deploy to GCP VM
 #   - DB 决策（默认 sqlite / postgres 探测→复用→自建幂等）
 #   - 数据卷属主防御（chown 1000:1000，无权限则 chmod 777 兜底）
 #   - 部署后健康检查（≤120s）+ 失败诊断输出（CI 日志 = 第一诊断现场）
+#
+# TASK-052 / BUG-010A 修复（2026-09-17）：
+#   旧 script 块最后三行是一条"前缀赋值命令"：
+#       ENV_FILE_CONTENT="$(cat "$ENV_TMP")" \
+#       DEPLOY_DIR=/home/.../app/k-agent \
+#       bash "$DEPLOY_DIR/scripts/gcp_deploy.sh"
+#   bash 前缀赋值（VAR=x cmd）只在 cmd 的*子进程环境*生效；同一命令行里的
+#   "$DEPLOY_DIR" 展开发生在当前 shell（此时 DEPLOY_DIR 未设置）→ 展开为空
+#   → bash "/scripts/gcp_deploy.sh" → No such file or directory → exit 127
+#   （CI run 35226142403 实锤）。
+#   修复（治本，不赌 shell 语义）：
+#     ① 所有 GCP 路径在 YAML 层用 secrets.GCP_VM_USER 展开为字面量，
+#        shell 块内零"前缀赋值 + 同命令引用变量"跨行依赖；
+#     ② ENV_FILE_CONTENT / DEPLOY_DIR 各自 export 成行（先于调用生效）；
+#     ③ bash 调用直接用字面路径，不依赖 shell 变量；
+#     ④ 开头 set -euo pipefail：任一步失败即中止，杜绝"假成功"；
+#     ⑤ env 临时文件 600 + trap 即删 + 显式 rm 双保险，内容永不回显。
+#   gcp_deploy.sh 本身不动（TASK-046 已验收：代码同步/DB 决策/属主防御/健康检查/诊断）。
 on:
   push:
     branches:
@@ -25,20 +43,25 @@ jobs:
           username: ${{ secrets.GCP_VM_USER }}
           key: ${{ secrets.GCP_SSH_PRIVATE_KEY }}
           # |- 去掉公共缩进：heredoc 定界符必须顶格（bash 语法要求），
-          # 且 <<'EOF' 引号定界符 = 内容完全按字面写入、零 shell 解释
+          # 且 <<'AGP_ENVFILE_EOF' 引号定界符 = 内容完全按字面写入、零 shell 解释。
           script: |-
+            set -euo pipefail
             # 注入 ENV_FILE secret 到宿主临时文件。
-            # 用"引号定界符 heredoc"（<<'AGP_ENVFILE_EOF'）：内容完全按字面写入，
+            # 引号定界符 heredoc（<<'AGP_ENVFILE_EOF'）：内容完全按字面写入，
             # 不做任何 shell 解释——多行 / 单引号 / 双引号 / $ / 反引号 均安全。
             # 定界符选一个 .env 文件不可能出现的行，避免误截断。
-            # 文件 600，用完即删，内容永不回显（CI 日志脱敏）。
-            mkdir -p /home/partners/app/k-agent
-            ENV_TMP="$(mktemp /home/partners/.envfile.XXXXXX)"
+            # 文件 600，trap + 显式 rm 双保险即删，内容永不回显（CI 日志脱敏）。
+            # BUG-010A: GCP 路径全部用 secrets.GCP_VM_USER 在 YAML 层展开为字面量。
+            mkdir -p /home/${{ secrets.GCP_VM_USER }}/app/k-agent
+            ENV_TMP="$(mktemp /home/${{ secrets.GCP_VM_USER }}/.envfile.XXXXXX)"
             chmod 600 "$ENV_TMP"
             trap 'rm -f "$ENV_TMP"' EXIT
             cat > "$ENV_TMP" <<'AGP_ENVFILE_EOF'
             ${{ secrets.ENV_FILE }}
             AGP_ENVFILE_EOF
-            ENV_FILE_CONTENT="$(cat "$ENV_TMP")" \
-            DEPLOY_DIR=/home/partners/app/k-agent \
-            bash "$DEPLOY_DIR/scripts/gcp_deploy.sh"
+            # BUG-010A: 各自 export 成行（先于 bash 调用生效），不再用前缀赋值。
+            export ENV_FILE_CONTENT="$(cat "$ENV_TMP")"
+            export DEPLOY_DIR="/home/${{ secrets.GCP_VM_USER }}/app/k-agent"
+            # 字面路径调用（YAML 层已展开为 /home/<user>/app/k-agent），不依赖 shell 变量。
+            bash /home/${{ secrets.GCP_VM_USER }}/app/k-agent/scripts/gcp_deploy.sh
+            rm -f "$ENV_TMP"
