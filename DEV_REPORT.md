@@ -1961,3 +1961,86 @@ GCP 现象（编排方实测）：8099 TCP 可连但 HTTP 空响应（Empty repl
 4. **sqlite 模式路径（T1）已独立验证 OK**——若 GCP `ENV_FILE` 实际配置为 sqlite，push 后 8099 即可恢复；但按"postgres 策略必须可用"验收口径，本修复（postgres 自建/复用路径）仍需随 push 一起生效。
 
 **交付**：修复 commit `ebfea7f`（`feat/gcp-fix-150`，**未 push**）+ 自测证据（`05-temp/t049/`）+ 本 §。回归放行交下游卡B（云天明，TASK-050）独立重跑 T3×3 + T1/T2/T4/T5/T6/T7。
+
+---
+
+## TASK-051 · PM 终审（BUG-009 修复后）+ push main + 盯 CI + 验证 GCP 34.121.9.233:8099 + 交付（1.5.0）（褚岩 · 2026-09-17 · t_166e00f1）
+
+> 终审卡（编排主卡 t_dcc0ba78 最后交付环节）。上游 TASK-049（章北海修复 BUG-009）+ TASK-050（云天明独立回归 PASS）完成后解锁。凭 project_root 读文件取修复后 commit（`feat/gcp-fix-150` @ `68cf7e6`，含修复 `ebfea7f`）+ 回归结论（PASS，P0=0/P1=0/P2=0）。
+
+### 1. 独立黑盒终审（不采信卡A/卡B/回归卡）
+
+**方法**：从 `git archive 68cf7e6` 干净上下文（只含追踪文件，天然排除 `.env`/`*.db`）**独立 docker build 重建镜像 `agp-platform:t051`**（10 关键 src 文件 镜像↔源树 md5 逐字节一致：core/db.py、core/config.py、core/app.py、core/schema_pg.sql、seed.py、engine/agent_engine.py、routers/api_hermes.py、routers/api1.py、llm/provider.py、mcp/mcp_client.py）。沙箱（`05-temp/t051/`，bare repo main = 68cf7e6 源码 + 隔离 compose（project=t051agp / 容器 t051-app / 端口 8593）+ **仅 3 处 RISK-015 守卫**（diff 已证：跳过 a(2) 扫描所有外部 postgres 容器 + a(3) 127.0.0.1 探测改黑洞 192.0.2.254，使脚本绝不可能复用线上 pg-unified / 127.0.0.1:5432））跑**真实** `gcp_deploy.sh`。**DB 决策/DSN 写回/健康检查/诊断逻辑 100% 是修复后真实代码**。全程未触碰线上 agp-app(1.4.0)/pg-unified/gw-nginx（前后 8099=200 / 8081=200 复核；收尾 t051-app/agp-pg 已清理，`docker ps` 只余线上 3 容器 + 既有 t0xx 遗留）。
+
+#### 1.1 静态审查 `scripts/gcp_deploy.sh`（@ 68cf7e6，修复后）
+
+| 维度 | 结论 |
+|---|---|
+| DSN 写回 host 值 · a(1) agp-pg 复用 | 容器名 `agp-pg`（可达：app 同在 `agp_default`，Docker DNS 按名解析）✅ |
+| DSN 写回 host 值 · a(2) 其他 postgres 容器 | 容器名 `$c`（同上）✅ |
+| DSN 写回 host 值 · a(3) 127.0.0.1 宿主本机 | 转宿主内网 IP（`hostname -I`，app 不在宿主 netns）✅ |
+| DSN 写回 host 值 · 自建 agp-pg | 容器名 `agp-pg`（同上）✅ |
+| `network connect agp_default` 与 DSN 写回时序 | **connect（L306-317）先于 DSN 写回（L327）**——时序正确，app 起时 PG 已在 `agp_default` ✅ |
+| 复用分支 map 乱序取错网络 | 无——`container_ip()` 已从 DSN 写回路径**彻底删除**（仅保留宿主侧 `--network host` 探测，探测用 IP 本身无碍）；DSN 全部走容器名 DNS，无 Go map 乱序取首项的 flaky 隐患 ✅ |
+
+**静态审查结论**：自建/复用 a(1)/a(2)/127.0.0.1 全部分支 DSN host 均为可达值（容器名或宿主内网 IP）；时序正确；复用分支无 map 乱序。BUG-009 的根因（DSN 抓 bridge IP + 时序缺陷 + map 乱序）已消除。
+
+#### 1.2 本地场景抽验（RISK-015 隔离容器，禁动线上）
+
+| 场景 | 结果 | 证据 |
+|---|---|---|
+| **T3 干净自建 ×3**（BUG-009 核心） | **PASS 3/3** | `t3_run1.out` / run2 / run3：3 次全部 `DSN_HOST=agp-pg`（**容器名，非 bridge IP**）；`PG 容器 agp-pg 已加入 agp_default`（L16 connect）**先于** `DSN 已写入 .env: host=agp-pg`（L17）；`t051-app restarts=0`（BUG-009 旧值=重启循环 restarts=88）；healthz 200；数据落 agp schema（PostgreSQL agp-pg:5432，22 表） |
+| T3 幂等重跑（keep 模式） | **PASS** | agp-pg "Up 7 minutes" **未重建**（same cid `7ce457f9…`，a(1) 复用分支生效），DSN=agp-pg，restarts=0 |
+| T1 sqlite 默认 | **PASS** | `t051-sqlite`：healthz 200，`AGP STARTUP OK backend=sqlite db=/app/data/agp.db`，restarts=0，23 种子表（users=4） |
+| T4 fail-fast ≤15s | **PASS** | `t051-bf`（黑洞 192.0.2.99）：**11s 退出 exit=3（≤15s）** + 明确日志 `AGP DB fail-fast: 连接 postgres 超时（>10s） host=192.0.2.99:5432 db=agp`，不 hang |
+
+**独立黑盒合计**：P0=0 / P1=0 / P2=0，与回归卡 TASK-050 一致。BUG-009 独立确认 FIXED（干净自建 DSN=容器名 3/3 + 幂等复用，从 t047/t048 的 bridge IP → 重启循环彻底翻转）。
+
+### 2. 判定闸门 + push main
+
+- **闸门**：P0=0 且 P1=0 → 满足"全绿才可 push 并部署" → **终审判定 PASS**，放行 push。
+- **merge**：`git checkout main && git merge --ff-only feat/gcp-fix-150`——main（`c705fad`）为 feat（`68cf7e6`）祖先，**fast-forward 成功**，main = `68cf7e6`，4 个 commit（d5ecd46 / 4272169 / ebfea7f / 68cf7e6）落入 main（10 文件，+1180/−85：deploy.yml、DEV_REPORT、README、docker-compose、gcp_deploy.sh、pg_probe.py、app.py、config.py、db.py、schema_pg.sql）。
+
+#### ⛔ push 被阻（真实阻塞，非终审 FAIL）
+
+`git push origin main` 被 GitHub 拒绝，**真实错误**：
+
+```
+! [remote rejected] main -> main (refusing to allow a Personal Access Token
+to create or update workflow `.github/workflows/deploy.yml` without `workflow` scope)
+```
+
+- **根因**：本机 git 凭据（`~/.git-credentials` 中的 PAT）**缺少 `workflow` scope**。GitHub 强制：更新 `.github/workflows/deploy.yml`（1.5.0 diff 内含该文件）必须持 `workflow` scope。凭据问题，与代码/终审无关。
+- **替代通道排查**：无 SSH key（`~/.ssh/` 不存在，`ssh -T git@github.com` = Permission denied publickey）→ 无第二通道。
+- **本地状态已保全**（用户修好 token 后可直接 `git push origin main`）：
+  - `main` 已 fast-forward 到 `68cf7e6`（= feat/gcp-fix-150），working tree clean，`origin/main` 仍 = `c705fad`（未变）。
+  - `deploy.yml` 已在本地 main 内（push 即带上）。
+
+**用户需处理（凭据，用户有 GCP/GitHub 权限）**：把 `~/.git-credentials` 的 PAT 换成含 **`workflow`** scope 的 token（或提供一把有 workflow 权限的 SSH key / 直接由用户 push），然后执行 `git push origin main`（在 `02-development/`）。push 一旦落地，deploy.yml 自动触发 GitHub Actions → 部署 GCP 34.121.9.233。
+
+### 3. CI 盯 run + GCP 34.121.9.233:8099 验证（AC-3/AC-4）
+
+**尚未执行**——因 push 未落地，deploy.yml 未触发，CI run 未产生，GCP 未部署。待 push 成功后：
+- 用 GitHub API 轮询最新 workflow run 至完成，确认部署脚本"部署后健康检查"通过（CI 日志含 `AGP STARTUP OK` + healthz 200）。
+- 从本机访问 `http://34.121.9.233:8099/healthz`（期望 HTTP 200）+ 登录 admin 进 UI（用 ENV_FILE 对应密码；若密码未知，至少 healthz + 静态页 200）。
+- AC-4：GCP `docker ps`（经 CI 诊断日志确认）agp-app healthy/running，无 restart 循环。
+- **若 push 后 CI 完成但 GCP 仍不通**：把 CI 诊断日志里的真实错误整理报用户（用户有 GCP 权限，必要时用户登录处理），**不擅自猜测 GCP 状态**。
+
+### 4. AC 对照（当前可交付口径）
+
+| AC | 状态 | 说明 |
+|---|---|---|
+| AC-1 T1~T7 全 PASS（隔离容器证据） | ✅ 满足 | 独立黑盒 T3×3+幂等 / T1 / T4 全 PASS；T2/T5/T6/T7 已由回归卡 TASK-050 独立 PASS（本卡抽验覆盖核心 T3/T1/T4） |
+| AC-2 deploy.yml 含 DB 决策 + 健康检查 + 失败诊断 | ✅ 满足 | 静态审查确认齐备（探测/复用/自建幂等 + 健康检查 + 诊断 + fail-fast + AGP STARTUP OK） |
+| AC-3 push main 后 CI 完成 + 8099 healthz 200 | ⛔ **BLOCKED** | push 被 PAT 缺 `workflow` scope 拒绝 → CI 未触发、GCP 未部署、8099 未验证 |
+| AC-4 GCP docker ps agp-app healthy 无 restart 循环 | ⛔ **BLOCKED** | 同 AC-3（依赖 push 后 CI 部署） |
+| AC-5 文档（DEV_REPORT §TASK-051 + README + compose tag 1.5.0） | ✅ 满足 | 本 §；README 部署章节（默认 sqlite + postgres 策略）TASK-048 已更新（无回退）；compose `image: agp-platform:1.5.0`（main @ 68cf7e6 在位） |
+| AC-6 本地 1.3.0/1.4.0 线上服务不受影响 | ✅ 满足 | 全程 + 收尾 agp-app(1.4.0)/pg-unified/gw-nginx 均 healthy，8099=200 / 8081=200 |
+
+### 5. 交付状态
+
+- **终审判定**：**PASS（P0=0/P1=0/P2=0，BUG-009 独立确认 FIXED）**。
+- **push**：⛔ **未落地**（PAT 缺 `workflow` scope，真实 GitHub 拒绝）——非终审问题，纯凭据阻塞；本地 main 已就绪（=68cf7e6），待用户修凭据后 `git push origin main` 即可。
+- **CI / GCP 8099**：⛔ **待 push 后执行**（见 §3）。
+- **交付给用户的明确状态**：1.5.0 代码修复经独立黑盒终审 PASS + 本地 T3×3/T1/T4 抽验全绿，main 已合并到 68cf7e6；**唯一剩余动作 = push main（需用户修 GitHub token 的 `workflow` scope 或由用户 push）**，push 后自动触发 GCP 部署，届时按 §3 验证 8099。
+- **剩余风险清单**：RISK-024（GCP 8099 未验证，依赖 push）、RISK-025（BUG-009 已 FIX 待 push 生效）、**新增 RISK-026（push 凭据 `workflow` scope 缺失，阻塞 AC-3/AC-4）**。
