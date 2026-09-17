@@ -2020,7 +2020,23 @@ to create or update workflow `.github/workflows/deploy.yml` without `workflow` s
 
 ### 3. CI 盯 run + GCP 34.121.9.233:8099 验证（AC-3/AC-4）
 
-**尚未执行**——因 push 未落地，deploy.yml 未触发，CI run 未产生，GCP 未部署。待 push 成功后：
+#### 3.1 push 已落地（2026-09-17 21:2x，用户修复凭据后由 cron 代执行）
+
+**push 证据**：
+- 用户已将 `~/.git-credentials` 的 PAT 换成含 `workflow` scope 的新 token（git 协议实测成功）。
+- `git push origin main` 成功：`c705fad..785818c`；`git ls-remote origin main` = **`785818cc0302c5b1cb128522e83c86294808720e`**（= 本地 main = 终审 PASS commit，含 68cf7e6 修复 + 本卡终审 commit）。
+- 工作树 clean（`git status --short` = 0 改动）；仓库已转 public（未认证 API 可读）。
+- **push 只执行了一次**（本卡约束：终审 PASS 后仅一次，不重复）。
+
+#### 3.2 CI Run 35226142403 = FAILURE（真实状态，非猜测）
+
+- Run：**35226142403** "Deploy to GCP VM" @ `785818cc`（main，2026-09-17T13:17Z）= completed / **failure**。
+- Job 105218107485 "deploy"：前置步骤（Set up / Build ssh-action / Checkout）均 success；**失败步骤 = "Deploy to GCP VM via SSH"（appleboy/ssh-action）**。
+- **失败日志无法读取**：`/actions/jobs/105218107485/logs` = **403 "Must have admin rights to Repository"**；本机新 PAT 走 GitHub REST API 一律 401（疑似 fine-grained 无 API 权限，git 协议正常）；本机无 gh CLI、无浏览器工具、无 GCP SSH key（`~/.ssh/` 不存在）→ **失败根因日志需用户（有 GCP/admin 权限）查看**。
+- **GCP 现状实测（2026-09-17 21:2x，多次复测）**：34.121.9.233 端口 22/80/4000/8099 均 OPEN，vLLM 4000/health=200（机器活着）；**8099 持续 TCP 可连但 HTTP 000**（与 1.4.0 故障同款特征）→ **1.5.0 尚未在 GCP 生效**。
+- 静态推断（**仅列为候选，非结论**）：deploy.yml 在 GCP 宿主执行 `$DEPLOY_DIR/scripts/gcp_deploy.sh`（= 宿主上 1.4.0 时代旧 checkout 的目录），脚本自身第 1 步先 `git reset --hard origin/main` 同步新代码——1.5.0 代码路径本身自洽；SSH 步骤失败的候选根因含：a) GCP 侧 git fetch 到 GitHub 失败（网络/凭据）、b) ENV_FILE/DB 决策分支、c) app 启动健康检查未过（脚本 exit 1 并打印诊断）、d) SSH 连接本身。真实错误以 CI 日志为准，**不擅自猜测 GCP 状态**（任务书约束）。
+
+**原计划（push 落地后执行项）**：
 - 用 GitHub API 轮询最新 workflow run 至完成，确认部署脚本"部署后健康检查"通过（CI 日志含 `AGP STARTUP OK` + healthz 200）。
 - 从本机访问 `http://34.121.9.233:8099/healthz`（期望 HTTP 200）+ 登录 admin 进 UI（用 ENV_FILE 对应密码；若密码未知，至少 healthz + 静态页 200）。
 - AC-4：GCP `docker ps`（经 CI 诊断日志确认）agp-app healthy/running，无 restart 循环。
@@ -2032,15 +2048,16 @@ to create or update workflow `.github/workflows/deploy.yml` without `workflow` s
 |---|---|---|
 | AC-1 T1~T7 全 PASS（隔离容器证据） | ✅ 满足 | 独立黑盒 T3×3+幂等 / T1 / T4 全 PASS；T2/T5/T6/T7 已由回归卡 TASK-050 独立 PASS（本卡抽验覆盖核心 T3/T1/T4） |
 | AC-2 deploy.yml 含 DB 决策 + 健康检查 + 失败诊断 | ✅ 满足 | 静态审查确认齐备（探测/复用/自建幂等 + 健康检查 + 诊断 + fail-fast + AGP STARTUP OK） |
-| AC-3 push main 后 CI 完成 + 8099 healthz 200 | ⛔ **BLOCKED** | push 被 PAT 缺 `workflow` scope 拒绝 → CI 未触发、GCP 未部署、8099 未验证 |
-| AC-4 GCP docker ps agp-app healthy 无 restart 循环 | ⛔ **BLOCKED** | 同 AC-3（依赖 push 后 CI 部署） |
+| AC-3 push main 后 CI 完成 + 8099 healthz 200 | 🔴 **FAIL（push ✅ / CI ❌）** | push 已落地（origin/main=785818c）；CI Run 35226142403 = failure（SSH 部署步骤）；8099 实测仍 000。失败根因日志 403 读不到 → 需用户查看 |
+| AC-4 GCP docker ps agp-app healthy 无 restart 循环 | 🔴 **FAIL（GCP 未生效）** | 1.5.0 未部署到 GCP（CI 失败）；8099 持续 000 |
 | AC-5 文档（DEV_REPORT §TASK-051 + README + compose tag 1.5.0） | ✅ 满足 | 本 §；README 部署章节（默认 sqlite + postgres 策略）TASK-048 已更新（无回退）；compose `image: agp-platform:1.5.0`（main @ 68cf7e6 在位） |
 | AC-6 本地 1.3.0/1.4.0 线上服务不受影响 | ✅ 满足 | 全程 + 收尾 agp-app(1.4.0)/pg-unified/gw-nginx 均 healthy，8099=200 / 8081=200 |
 
 ### 5. 交付状态
 
 - **终审判定**：**PASS（P0=0/P1=0/P2=0，BUG-009 独立确认 FIXED）**。
-- **push**：⛔ **未落地**（PAT 缺 `workflow` scope，真实 GitHub 拒绝）——非终审问题，纯凭据阻塞；本地 main 已就绪（=68cf7e6），待用户修凭据后 `git push origin main` 即可。
-- **CI / GCP 8099**：⛔ **待 push 后执行**（见 §3）。
-- **交付给用户的明确状态**：1.5.0 代码修复经独立黑盒终审 PASS + 本地 T3×3/T1/T4 抽验全绿，main 已合并到 68cf7e6；**唯一剩余动作 = push main（需用户修 GitHub token 的 `workflow` scope 或由用户 push）**，push 后自动触发 GCP 部署，届时按 §3 验证 8099。
-- **剩余风险清单**：RISK-024（GCP 8099 未验证，依赖 push）、RISK-025（BUG-009 已 FIX 待 push 生效）、**新增 RISK-026（push 凭据 `workflow` scope 缺失，阻塞 AC-3/AC-4）**。
+- **push**：✅ **已落地**（2026-09-17 21:2x）——用户修复凭据（PAT 加 `workflow` scope）后由 cron 代执行，`origin/main = 785818c`，工作树 clean，只 push 一次。
+- **CI**：🔴 **Run 35226142403 = failure**（"Deploy to GCP VM via SSH" 步骤失败；日志 403 不可读，见 §3.2）。
+- **GCP 8099**：🔴 **仍故障（实测 000，1.5.0 未生效）**——需用户提供 CI 日志真实错误 / 登录 GCP 诊断。
+- **交付给用户的明确状态**：1.5.0 代码修复经独立黑盒终审 PASS + 本地 T3×3/T1/T4 抽验全绿 + push 已落地 origin/main=785818c；**剩余阻塞 = CI 部署失败（根因日志需用户权限读取）→ GCP 8099 未修复**。用户三选一：① 读 CI Run 35226142403 "Deploy to GCP VM via SSH" 日志发真实错误；② 登录 GCP VM（partners@34.121.9.233）看 /home/partners/app/k-agent 下 docker ps / docker logs agp-app / src/.env；③ 授权团队走 code-fix 流程排查。
+- **剩余风险清单**：RISK-024（GCP 8099 仍未修复，CI failure 待诊断）、RISK-025（BUG-009 已 FIXED，代码已 push，待 GCP 部署生效）、RISK-026（push 凭据问题已解决；**遗留**：新 PAT 无 GitHub API 权限（REST 401）且 logs 接口 403，CI 日志只能用户侧读）。
