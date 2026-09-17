@@ -1897,3 +1897,67 @@ GCP 现象（编排方实测）：8099 TCP 可连但 HTTP 空响应（Empty repl
 1. **BUG-009（P0，阻塞）**：GCP 8099 修复核心路径（postgres 自建）不可用，待章北海修复 + 回归 + 终审后 push。sqlite 模式路径（T1）已独立验证 OK——**若 ENV_FILE 实际配置为 sqlite，当前版本 push 即可修复 GCP 8099**；但按任务书"postgres 策略必须可用"的验收口径，仍须修复后再 push（ENV_FILE 内容不可见，不假设其值）。
 2. **GCP 现状未变**：34.121.9.233:8099 仍故障（本卡未 push，未触发部署，不擅自触碰 GCP）。CI 上次 success 但应用未起好的盲点已由 1.5.0 健康检查修复，待 push 后生效。
 3. 既有非阻塞风险（RISK-020/021/023 等）见 STATUS.md 阶段六/七遗留清单，本轮无新增。
+
+## TASK-049 · 修复 BUG-009（gcp_deploy.sh DSN 写容器名，章北海 · 2026-09-17 · t_3d2123e0）
+
+> 修复卡：针对卡B（TASK-047）/卡C（TASK-048）独立双确认的 P0 BUG-009——`gcp_deploy.sh` 在 `docker network connect agp_default` **之前**用 `container_ip()`（Go map 乱序取首项网络 IP）抓 PG 容器 IP 写进 DSN `DB_HOST`；自建场景此时容器只挂 bridge → DSN 写 bridge IP（172.17.0.x），app 在 `agp_default` 连 bridge IP 不可达 → fail-fast 重启循环 → **GCP 8099 部署后依旧不通**。
+
+### 1. 根因（与卡B/卡C 定位一致，本卡修复时复核）
+
+`scripts/gcp_deploy.sh` 旧逻辑两处缺陷叠加：
+
+1. **时机错误**：DSN 写回（旧 L301-308）发生在 `docker network connect agp_default`（旧 L325-345）**之前**。自建场景下此时 `agp-pg` 只有 bridge 网一个 IP → `container_ip()` 抓到 bridge IP（172.17.0.x）。
+2. **map 乱序**：`docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' | awk '{print $1}'` 是 Go map 迭代乱序取首项——即便容器已有 2 网络（bridge + agp_default），取到哪个 IP 是**随机**的（flaky）。
+
+结果：app（经 `.compose.agp-net.yml` 叠加在 `agp_default`）连 bridge 段 IP 不可达（跨网络路由不通，卡B `nc` 实测 timed out）→ `_pg_connect` 10s 超时 → `AGP DB fail-fast` → uvicorn 退出 → `restart: unless-stopped` 重启循环（卡B 实测 restarts=88）。
+
+### 2. 修复方案（PM 终审已实测验证的**首选方向 A**：DB_HOST 写容器名）
+
+**改动文件**：仅 `scripts/gcp_deploy.sh`（1 文件，+19/-17 行，commit `ebfea7f`）。
+
+核心变更：
+- **删除** DSN 写回前的 `container_ip()` 抓 IP 块（旧 L301-308）——`DB_HOST` 直接写**容器名**（`decide_ds`：自建=`agp-pg` / 复用=`容器名`）。
+- **提前** `docker network connect agp_default "$decide_ds"` 到 DSN 写回**之前**执行（原 L325-345 网络块删除，合并进 DSN 写回前的 case 块）：app 经 `.compose.agp-net.yml` 也在 `agp_default` → Docker 内置 DNS 按容器名解析，跨重连/重启稳定，**彻底消除 map 乱序问题**。
+- case 分支统一覆盖三类容器源：
+  - `agp-pg|agp-pg(created)` → 自建 agp-pg（created 含幂等复用，`PG_CRED_HOST` 值 `agp-pg(created)` 需显式匹配）
+  - `container:*` → a(2) 复用其他 postgres 容器（`$decide_ds`=容器名）
+  - `localhost` → 127.0.0.1 宿主本机 PG（**不** join agp_default，保持原行为）
+
+**任务书 5 项覆盖要求逐条核对**：
+
+| # | 要求 | 覆盖情况 |
+|---|---|---|
+| 1 | 自建分支（L301-308 EFF_HOST 决策） | ✅ `decide_ds="$PG_CONTAINER"`（L292），DSN 直接写容器名，不再抓 IP |
+| 2 | 复用分支 a(1) agp-pg（L191）/ a(2) 其他容器（L214） | ✅ 同链路统一容器名（`decide_ds` 复用分支本就是容器名 L195/218/224），connect 统一提前 |
+| 3 | `127.0.0.1` 宿主内网 IP 路径不回归 | ✅ 未改动该分支：`EFF_HOST="127.0.0.1"` → `hostname -I` 转宿主内网 IP（app 不在宿主 netns）；`localhost` 分支**不** join agp_default（T5 实测） |
+| 4 | 容器名方案依赖 compose 叠加 `.compose.agp-net.yml` 把 app 接进 agp_default | ✅ 机制不变（L362-374，`PG_CRED_HOST` 非空即叠加）；**localhost 分支不依赖 agp_default**（`PG_CRED_HOST=localhost` 时 case 不 connect，app 走 bridge 连宿主内网 IP，未弄坏该分支——T5 验证） |
+| 5 | `probe_container`（L128-137）抓 IP 仅用于宿主侧探测，只改 DSN 写回 | ✅ `probe_container`/`container_ip`/`ensure_db` 全部**未动**（宿主 `--network host` 可路由任意容器 IP，探测用 IP 本身没问题）；只改了 DSN 写回 .env 的 host 值 |
+
+**为什么首选 A 而非备选 B**（connect 前提取 + 显式 agp_default IP）：A 无 map 乱序、无"connect 后 IP 可能变"的时序耦合、跨容器重启/网络重连都稳（DNS 名解析）；B 虽可行但仍是"抓 IP"路径（保留时序敏感）。PM 终审 S3 已独立实测 A 有效（2s healthy + 数据落 agp schema 22 表 + restarts=0，`05-temp/t048/s3_result.txt`）。
+
+### 3. 自测证据（沙箱 `05-temp/t049/`，RISK-015 隔离，只动 t049-* 容器）
+
+**沙箱口径**（与 t047/t048 一致）：从 `git archive` 干净上下文（bare repo `origin.git` main = `ebfea7f` + **2 行 RISK-015 守卫**：`agp-pg→t049-pg` 避免与线上/他沙箱 PG 重名误伤 + `pg_isready` 改容器内自测）+ 隔离 compose（端口 8499 / 容器名 t049-app / 镜像 tag 1.5.0-t049 / 去 hermes 挂载）。沙箱 main vs `ebfea7f` 的 diff 仅 2 文件（`sandbox_delta.txt`）：`docker-compose.yml`（7 行隔离）+ `gcp_deploy.sh`（4 行守卫）——**DB 决策/DSN 写回/健康检查/诊断逻辑 100% 真实代码**。脚本副本 `gcp_deploy_sandbox.sh` 与 clone 进 DEPLOY_DIR 的脚本同源同内容。
+
+**为何需要守卫**：本 VM `127.0.0.1:5432` 有线上 `pg-unified`（RISK-015 红线：禁动）。无守卫脚本在 postgres 模式下会真连线上库。守卫 P1 使自建目标为 `t049-pg`，P2 使就绪探测走容器内自测。
+
+| 场景 | 结果 | 证据 |
+|---|---|---|
+| **T1 sqlite 默认** | ✅ PASS | `t1_healthz.txt`：healthz 200 `db.backend=sqlite`，graph_nodes=7/edges=8 |
+| **T3 干净自建 ×3**（BUG-009 核心） | ✅ **PASS 3/3** | `t3_summary.txt`：run1/2/3 全部 DSN=`t049-pg`（**容器名**，非 bridge IP）+ healthz 200 + `AGP STARTUP OK` + **22 表落 agp schema** + restarts=0；t049-pg networks=[agp_default=172.18.0.9 bridge=172.17.0.4]（对比 t047/t048 的 DSN=172.17.0.4 bridge IP FAIL） |
+| **T3i 重跑幂等**（不重建 t049-pg，a(1) 复用） | ✅ PASS | `t3i_summary.txt`：同容器复用（cid 一致）+ DSN 容器名 + healthz 200 + `✓ 复用已自建容器 agp-pg（幂等，不重建）` |
+| **T2 复用分支**（预设独立 PG 容器 t049-foreign-pg，a(2)） | ✅ PASS | `t2_summary.txt`：DSN=`t049-foreign-pg`（容器名）+ healthz 200 + 22 表落 agp schema + restarts=0 + `✓ 复用容器 t049-foreign-pg（凭据来自 ENV_FILE）` |
+| **T4 不可达 DSN fail-fast ≤15s**（不回归） | ✅ PASS | `t4_logs.txt`：TEST-NET-1 黑洞 192.0.2.1 → fail-fast **0.09s**（阈值 ≤15s）+ 明确日志 `AGP DB fail-fast: 连接 postgres 失败 host=192.0.2.1...`，不 hang，exit=3 |
+| **T5 127.0.0.1 宿主本机 PG 复用**（要求 3 不回归） | ✅ PASS | `t5_host127.txt`：宿主 15432 起 testpg（独立凭据 t049host/t049hostpass，使 a(2) 扫描不匹配 → 唯一可复用路径 = a(3) 127.0.0.1:15432）→ DSN 转**宿主内网 IP 192.168.48.134**（非 127.0.0.1，app 不在宿主 netns）+ healthz 200 + `✓ 复用 127.0.0.1:15432（凭据来自 ENV_FILE）` + `127.0.0.1 复用 → app 容器改用宿主内网 IP 192.168.48.134` |
+| 线上未触碰 | ✅ | `online_check.txt`：agp-app 1.4.0 healthy / pg-unified healthy / gw-nginx healthy / 本地 8099=200；收尾无遗留 t049-*/agp-pg 容器 |
+
+**合计：PASS 9 / FAIL 0（P0=0, P1=0）**。BUG-009 核心场景（T3 干净自建）从 t047/t048 的 **FAIL 3/3（DSN=bridge IP）** 翻转为 **PASS 3/3（DSN=容器名）**。
+
+### 4. 已知问题 / 说明
+
+1. **自测 harness bootstrap 缺陷（已修，非产品缺陷）**：首跑/二跑 T1 曾 `rc=127`，因 `clean_state` 删除 `$DEPDIR`（含其内 `scripts/gcp_deploy.sh` 本体），导致 `run_deploy` 引用 `"$DEPDIR/scripts/gcp_deploy.sh"` 失效。已改为从 `origin.git main` 提取独立副本 `gcp_deploy_sandbox.sh`（与 clone 脚本同源），三跑后全绿。`summary.txt` 保留历史轮留痕。
+2. **T4 计时正则修正**：docker logs `--timestamps` 行首含日期（`2026-09-17T09:30:04.269...`），初版正则误取日期段致间隔算成 98523s；已修正为取 T 后 `时:分:秒.毫秒` 段，实测 fail-fast=0.09s。
+3. **GCP 现状未变**：本卡仅修复 + 本地沙箱自测，**未 push 远程、未 merge main、未触发 GCP 部署**（按约束 push 只在终审 PASS 后由卡C 执行一次）。34.121.9.233:8099 仍故障，待卡B（TASK-050）独立回归 + 卡C 终审 PASS 后 push 生效。
+4. **sqlite 模式路径（T1）已独立验证 OK**——若 GCP `ENV_FILE` 实际配置为 sqlite，push 后 8099 即可恢复；但按"postgres 策略必须可用"验收口径，本修复（postgres 自建/复用路径）仍需随 push 一起生效。
+
+**交付**：修复 commit `ebfea7f`（`feat/gcp-fix-150`，**未 push**）+ 自测证据（`05-temp/t049/`）+ 本 §。回归放行交下游卡B（云天明，TASK-050）独立重跑 T3×3 + T1/T2/T4/T5/T6/T7。
