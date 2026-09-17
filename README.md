@@ -184,6 +184,8 @@ tests/           pytest 套件（auth/agents/chat/rag/memory/mcp/longtext/ws）
 
 ### 方式 A：一键部署脚本 `./deploy.sh`（推荐）
 
+> **1.5.0 起 GCP 云端部署（CI 自动）走 `scripts/gcp_deploy.sh`**，数据库策略见下方"数据库自动决策（1.5.0）"。本地/手动部署仍用本节 `./deploy.sh`。
+
 ```bash
 cd 02-development
 
@@ -220,6 +222,26 @@ open  http://localhost:8099/            # 前端 SPA，admin / <SEED_PASSWORD> �
 ```
 
 常用运维：`docker compose logs -f`、`docker compose ps`、`docker compose down`（保留卷数据）。
+
+### 数据库自动决策（1.5.0，GCP 云端部署）
+
+`scripts/gcp_deploy.sh`（由 CI push main 后经 SSH 在 GCP 宿主执行）按 `.env` 的
+`DB_BACKEND` 自动决策数据库，**默认 sqlite，零外部依赖，clone 即跑**：
+
+| `.env` 取值 | 行为 |
+|---|---|
+| 无 `DB_BACKEND` 或 `=sqlite`（大小写不敏感） | 一律写回 `DB_BACKEND=sqlite`，跳过 DB 探测 |
+| `=postgres` | 按序：① 探测已有 PG（`agp-pg` 自建容器 → 其他 postgres 容器 → `127.0.0.1:5432`）；② 可复用（连通 + 凭据正确 + 库可查）→ 直接复用；③ 复用不了 → **自建 `agp-pg`**（`postgres:16-alpine`，数据卷持久化 `$DEPLOY_DIR/pgdata/`，密码来自 `.env` 或生成后持久化到 `$DEPLOY_DIR/.pg_credentials` chmod 600，`pg_isready` 等就绪），并把有效 DSN 写回 `.env` |
+
+幂等性：重跑 deploy 时 `agp-pg` 已存在且健康 → 复用不重建；已退出 → `docker start` 后复用。
+
+**应用侧兜底（fail-fast，1.5.0 新增）**：无论 DB 策略如何，启动连 DB 超时 ≤15s 即
+打明确错误日志后退出（`AGP DB fail-fast: ...`），绝不无限 hang——配置错误也表现为
+"容器重启 + 日志可读"。启动成功后 stdout 打 `AGP STARTUP OK backend=...` 就绪标记。
+deploy 脚本在 `compose up` 后轮询 `/healthz`（≤120s），失败时自动打印
+`docker logs --tail 100` + `docker ps -a` + 容器 restart 次数再 exit 1——
+CI 日志即第一诊断现场。数据卷属主防御：up 前 `mkdir -p src/data && chown 1000:1000`
+（无权限则 chmod 777 兜底并告警）。
 
 ### 方式 B：原生进程（本地开发）
 

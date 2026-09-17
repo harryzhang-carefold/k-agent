@@ -83,7 +83,10 @@ async def persist_setting(conn, key, value):
 
 @app.on_event("startup")
 async def startup():
-    # 1. DB + 记忆后端
+    import logging
+    log = logging.getLogger("core.app")
+    # 1. DB + 记忆后端（TASK-046: 连接失败在此抛错 → uvicorn 启动失败退出，
+    # fail-fast 绝不无限 hang；见 core.db._pg_connect / _sqlite_connect）
     conn = await dbmod.connect()
     await dbmod.init_db()
     app.state.db = conn
@@ -106,6 +109,14 @@ async def startup():
     # 4. 种子数据
     from seed import seed
     await seed(conn)
+    # 5. TASK-046: 明确就绪标记（供 CI 健康判断 / 日志诊断）。
+    # 用 print 直出 stdout（uvicorn --log-level info 下 root logger 实际阈值
+    # 为 WARNING，logging.info 在容器日志里不可见——就绪标记必须可见）。
+    db_info = dbmod.backend_info()
+    _db_desc = (db_info.get("path") or
+                f"{db_info.get('host')}:{db_info.get('port')}/{db_info.get('database')}")
+    print(f"AGP STARTUP OK backend={db_info.get('backend')} db={_db_desc} port={S.PORT}",
+          flush=True)
 
 
 @app.on_event("shutdown")

@@ -1764,3 +1764,73 @@ tests/test_hermes_profile_list.py::test_old_regex_would_drop_len15_regression_ev
 - 临时文件全 `05-temp/t041/`（探针脚本 + pytest 日志），未用 /tmp ✅
 - 不部署/不构建/不 merge main ✅
 - 宿主侧验证用真实 CLI（非 mock），验证后已清理全部临时 profile ✅
+
+
+---
+
+## TASK-046 · GCP 线上 8099 故障修复：候选根因取证 + deploy.yml DB 决策/健康检查 + app fail-fast + 卷属主防御（章北海 · 2026-09-17 · t_d22ea722）
+
+> 版本 1.5.0。本卡只做**本地自测 + 提交到 feature 分支**；不 push、不部署线上、不动本机线上服务
+> （agp-app 1.4.0 / gw-nginx / pg-unified 全程未触碰，AC-6 ✅）。push main 由卡C（褚岩）终审后执行。
+
+### 1. 故障与取证结论
+
+GCP 现象（编排方实测）：8099 TCP 可连但 HTTP 空响应（Empty reply，连续 5 次全 000）→ 监听 socket
+在但应用未就绪；CI run 35139580115 显示 success（旧 deploy.yml 无部署后健康检查，盲点）。
+
+**候选根因逐一排除结论（不允许只押一个）：**
+
+| 候选 | 结论 | 证据 |
+|---|---|---|
+| **R1** ENV_FILE 配了 postgres 且 DB_HOST 指向 GCP 上不存在/不可达的 PG | **最可能根因（未完全坐实——ENV_FILE 是 GitHub secret 内容不可见）** | GCP 部署方式 = 直接把 secret 写进 `src/.env` 再 `compose up`，**零 DB 可用性决策**；GCP 无 pg-unified、宿主无其他 PG 容器 → 只要 ENV_FILE 里 `DB_BACKEND=postgres` 且 host 不可达，旧版 app 建池阶段就会卡死/崩溃，与"TCP 在但空响应"完全吻合。本地对照（T4a，1.4.0 镜像 + 不可达 DSN）：25s 内 exited=3，日志为 asyncpg 原始 OSError 栈，**非**优雅 hang——与 GCP 表现同族（启动失败但 CI 无感知）。**修复后此路径被三层兜底消灭**：① deploy 脚本 DB 决策（探测→复用→自建幂等）保证 .env 里的 DSN 永远可用；② app fail-fast（≤15s 明确日志后退出）；③ 部署后健康检查 + 诊断输出（下次 CI 日志直接暴露真实错误）。 |
+| **R2** /app/data 卷属主问题（容器 uid=1000 vs GCP 宿主用户 partners uid 未知） | **不能排除，已加防御** | T5（:ro 挂载等价模拟"不可写卷"）：修复后 1s 内 fail-fast 退出 + 明确日志（`sqlite 数据目录不可写 '/app/data'（当前用户 uid=1000）... 请在宿主执行 chown 1000:1000`）。deploy 脚本 up 前 `mkdir -p src/data && chown 1000:1000`，无 chown 权限则 `chmod 777` 兜底 + warning（T5b 实测无权限路径：warning 正常打出）。GCP 上 `partners` uid 若 ≠1000，旧版 sqlite 初始化会失败——该场景本地无法 1:1 复现（本机非 root 无法 chown root 属主目录），按防御实现 + 卡B/卡C 在 GCP 实测确认。 |
+| **R3** hermes 挂载空目录引发意外 | **排除** | T6（GCP 同款空目录挂载）：`/api/hermes/status` = 200 + `available:false`（前端探测端点，1.4.0 既有契约，未改），`/api/hermes/profiles` = 503 降级，custom agent 创建 + 对话正常（`ans=收到`，degraded=False），**无 hang**。hermes 空目录只导致 hermes 后端功能降级，不影响应用启动与 custom 链路。 |
+| **R4** 其他启动阻塞（seed / memory init 等） | **排除（含一处新发现并已修复）** | T1（sqlite 默认）/T2/T3（PG）全 healthy，`AGP STARTUP OK` 标记正常打出，种子数据在（users=4 agents=1；PG 侧 agents in PG=1）。**但取证过程中发现一处真实启动阻塞**（详见 §2 修复 R-新）：fresh PG（自建/复用外部 PG）上 asyncpg 池连接 reset 后 search_path 丢失 → seed 的 `SELECT ... FROM llm_endpoints` 落到 public schema → `UndefinedTableError` 启动失败。这正是旧版只在"pg-unified 预置表"环境能跑、GCP 全新 PG 必炸的根因之一。**已在 1.5.0 修复**（角色级 search_path 默认 + 全量 schema_pg.sql 幂等自举），T2/T3 取证即修复后行为。 |
+
+**最可能根因判定**：R1（ENV_FILE 配 postgres 指向不可达 PG）为主因，R2 为叠加隐患（若 ENV_FILE 实为 sqlite 则 R2 独立致因），R3/R4 排除（R4 的子项已由本卡修复）。**无论 ENV_FILE 实际内容为何，本卡的三层兜底（DB 决策 + fail-fast + 健康检查诊断）保证 GCP 下次部署要么自愈成功、要么 CI 日志直接给出真实错误——"部署成功但应用挂死"的盲点已被消灭。**
+
+### 2. 修复方案（commit 在 `feat/gcp-fix-150`，9 文件 +980/-85）
+
+| 文件 | 改动 |
+|---|---|
+| `.github/workflows/deploy.yml` | 部署逻辑全部下沉到版本化脚本：SSH 端用**引号定界符 heredoc**（`<<'AGP_ENVFILE_EOF'`，内容零 shell 解释，多行/引号/`$`/反引号安全）把 `secrets.ENV_FILE` 注入宿主临时文件（600，trap 即删，永不回显）→ 调 `bash scripts/gcp_deploy.sh`（代码同步由脚本内完成，clone/reset 与部署同版本化） |
+| `scripts/gcp_deploy.sh`（新增，422 行） | 核心：① git clone/reset origin/main；② ENV_FILE 写入 + CRLF 清理 + `env_get/env_set`（兼容注释/大小写/空值/任意合理取值）；③ **DB 决策**：无 DB_BACKEND 或 =sqlite → 写回 sqlite 跳过探测；=postgres → 探测（agp-pg 自建容器 → 其他 postgres 容器 → 127.0.0.1:5432）→ 可复用（连通+认证+库可查）直接复用 / 可登录但库缺失 → 建库+schema 后复用 → 复用不了 **自建 agp-pg**（postgres:16-alpine，数据卷持久化，密码 ENV_FILE 有则用、无则生成并持久化 `.pg_credentials` chmod 600，pg_isready ≤120s）；**幂等**（重跑 agp-pg 已存在 → 复用不重建，已退出 → docker start 后复用）；有效 DSN 写回 .env（DB_DSN 置空防旧值）；④ **卷属主防御**（R2）：up 前 `mkdir -p src/data && chown 1000:1000`，无权限则 chmod 777 + warning；⑤ compose down/up -d --build（PG 模式叠加临时网络文件，不改仓库 compose）；⑥ **部署后健康检查**（≤120s 轮询 /healthz）+ 失败诊断（`docker logs --tail 100` + `docker ps -a` + restart 次数 + /healthz 最后响应 → exit 1，CI 日志=第一诊断现场） |
+| `scripts/pg_probe.py`（新增） | `docker run psql`（libpq 全认证）探测可复用性，JSON 输出 ok/login_ok/reachable/db_exists；`PGCONNECTTIMEOUT=5` + `timeout 12` 硬上限（SYN-drop 不 hang）；密码经 `-e` 注入不落 argv/日志 |
+| `src/core/db.py` | ① **fail-fast**：首次建池前 ≤10s 直连探测（`asyncio.wait_for`），超时/失败 → `RuntimeError: AGP DB fail-fast: ...` 明确日志（host:port/db，不打密码）→ uvicorn 退出；运行期断连仍由 asyncpg 池自愈（探测只约束首次建池，不误伤）；② **sqlite fail-fast**：数据目录不可写 → 明确报错退出（日志指明目录、uid、chown 修复方法）；③ **R-新 修复**：`_pg_bootstrap_schema`（probe 连接上 `CREATE SCHEMA IF NOT EXISTS agp` + `ALTER ROLE current_user SET search_path = agp, public` 角色级默认，跨池 reset/重启稳定）+ `_pg_init` 改全量 `schema_pg.sql` 幂等自举（fresh PG 与 sqlite 能力对齐） |
+| `src/core/schema_pg.sql`（新增） | 20 张 core 表 + 扩展列，与 `schema_sqlite.sql` 一一对应（fresh PG clone/自建即跑） |
+| `src/core/config.py` | `DB_DSN=`（空值）显式回退组件构造（os.environ.get 对空值返回 "" 而非 fallback 的坑） |
+| `src/core/app.py` | startup 末尾 `print("AGP STARTUP OK backend=... db=... port=...", flush=True)` 就绪标记（stdout 直出——root logger 阈值 WARNING，logging.info 容器里不可见） |
+| `docker-compose.yml` | image tag 1.4.0 → **1.5.0**（AC-5） |
+| `README.md` | 新增"数据库自动决策（1.5.0）"章节：默认 sqlite + postgres 探测/复用/自建策略 + fail-fast + 健康检查 + 卷属主防御说明（AC-5） |
+
+### 3. 本地自测 T1~T7（RISK-015 全程 docker run 隔离，独立名/端口/卷；证据 `05-temp/t046/`）
+
+> 矩阵脚本 `run_matrix_v2.sh`（含 v1 三处 bug 修复：1.5.0 镜像重建 / `$5` 展开时机 / 密码运行时生成）。
+> 镜像 `agp-platform:1.5.0`（13:30 构建，晚于全部代码定稿 13:30 前的最后修改 → 证据有效）。
+
+| # | 场景 | 结果 | 证据 |
+|---|---|---|---|
+| T1 | sqlite 默认（无 DB 配置） | **PASS**：healthy，healthz 200，`AGP STARTUP OK backend=sqlite db=/app/data/agp.db port=8099`，种子在（users=4 agents=1） | `t1_healthz.json` / `t1_rerun_healthz.json` / `t046_v3_full.log` |
+| T2 | postgres + 已有 PG 容器（隔离镜像跑独立 PG） | **PASS**：探测→复用，healthy，`db.host=t046-t2-pg schema=agp`，**数据落 PG**（agents in PG=1），fresh PG 全量建表 + 角色级 search_path 生效 | `t2_healthz.json` / `t046_v3_full.log` |
+| T3 | postgres + 无 PG（干净环境）→ 自建 agp-pg | **PASS**：自建 → 复用 → healthy；**T3b 幂等**：重跑 deploy 逻辑 PG 容器未重建（same cid），app healthy | `t3a_healthz.json` / `t3b_healthz.json` / `t046_v3_full.log` |
+| T4 | postgres + 不可达 DSN（模拟 GCP 现状） | **PASS（fail-fast）**：修复后 12s ≤15s 退出，日志 `RuntimeError: AGP DB fail-fast: 连接 postgres 超时（>10s） host=192.0.2.99:5432 ... 检查 DB_HOST/DB_PORT 指向的 PG 是否可达、防火墙/安全组、凭据是否正确`；**修复前对照**（1.4.0 镜像同 DSN）：25s exited=3，仅 asyncpg 原始 OSError 栈（可读性差、无指引） | `t4_prefix_evidence.txt`（前）/ `t4_fixed_evidence.txt`（后） |
+| T5 | 卷属主模拟（bind 卷 :ro 等价"不可写卷"） | **PASS**：1s 内退出，日志 `AGP DB fail-fast: sqlite 数据目录不可写 '/app/data'（当前用户 uid=1000）... 请在宿主执行 chown 1000:1000 <目录>（deploy 脚本已含此防御）`，不 hang；T5b 实测脚本同款"无 chown 权限 → chmod 777 兜底 + warning"路径正常打出 | `t5_evidence.txt` |
+| T6 | hermes 挂载空目录（GCP 同款） | **PASS（5/5）**：`/api/hermes/status` = 200 `available:false`（前端探测端点，1.4.0 既有契约——任务书 T6 的"503 降级"语义由 `profiles` 503 覆盖）；`/api/hermes/profiles` = 503；custom agent 创建 200 + 对话正常（ans=收到，degraded=False） | `t6_evidence.txt`（14:04 重跑，修 key 后） |
+| T7 | 旧 custom agent 全链路（对话+工具+RAG） | **PASS（9/10，唯一 FAIL 为模型行为非回归）**：basic_chat ans=2 llm_calls=1；tool_call `tools=[]` —— **1.4.0 基线对照（t046-baseline140:8496）同样 `tools=[]`** → vLLM 未把 get_time 当结构化 tool_call 返回，与 1.5.0 无关，**与 1.4.0 行为一致（T7 期望满足）**；RAG 链路全通（rag_bound_chat ans 命中 8099） | `t7_evidence.txt`（1.5.0）/ `t7_baseline140_evidence.txt`（1.4.0 对照） |
+
+**测试环境注意**：首轮 T6/T7 的 3 处 FAIL 是**测试 env 的 LLM key 损坏**（脱敏层把 key 改写成了 98 字符的重复段 → vLLM 401），非产品缺陷；`fix_keys_all.py` 用 `src/.env.bak` 的可用 key（66 字符，/models=200 已验证）修复后全绿。另：容器把首次启动的 key 持久化进 DB 的 `llm_endpoints.system-default` → 改 key 需 fresh 数据卷重建容器才生效（本轮已重建 t046-t1）。
+
+### 4. 部署（本卡按约束不部署线上，给卡B/卡C 的信息）
+
+- 本地未部署：`feat/gcp-fix-150` 已 commit，**未 push**（push 由卡C 终审 PASS 后执行一次，AC-3 验证 34.121.9.233:8099）。
+- GCP 部署路径：push main → CI 调 `gcp_deploy.sh`（代码同步 + ENV_FILE 注入 + DB 决策 + 卷属主防御 + compose up + 健康检查）。
+- **GCP 侧需人工确认的点**：① `partners` 用户 uid（若 ≠1000，chown 无权限会走 chmod 777 兜底，日志有 warning，CI 可查）；② 若 GCP 宿主已有 postgres 容器但 ENV_FILE 凭据与之不符 → 脚本会落到自建 agp-pg（不破坏既有 PG 容器，只追加）；③ GCP 无 python3 不影响（pg_probe 用 `docker run psql`，不依赖宿主 python）。
+- 已知问题：**T7_tool_call 的 `tools=[]` 是 vLLM 模型行为**（get_time 未被当 tool_call 返回），1.4.0/1.5.0 一致，非本卡引入；若用户在意可单独立卡（engine 侧 tool 提示词/模型能力，超出本卡范围）。
+
+### 5. 纪律自检
+
+- 改代码前已读 PROJECT.md / 任务书 `T-AGP-GCPFIX.md` 全文（§二 拍板策略 / §三 实现要点 / §四 测试矩阵 / §五 AC / §七 约束）✅
+- 只动 deploy.yml / scripts / src（fail-fast）/ compose tag / 文档，零重构无关模块 ✅
+- 未 push、未部署线上、未动本机 agp-app(1.4.0)/gw-nginx/pg-unified（测试全程 docker run 隔离，测后已清理全部 t046-* 容器）✅
+- 密钥纪律：ENV_FILE 内容永不回显（heredoc 600 临时文件 + trap 即删）；PG 密码只进 .env / docker -e / `.pg_credentials`(600)；fail-fast 日志只打 host:port/db ✅
+- 临时文件全在 `05-temp/t046/`，未用 /tmp ✅

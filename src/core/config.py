@@ -74,9 +74,11 @@ class Settings:
     DB_PASSWORD = _get("AGP_DB_PASSWORD", "")
     DB_SCHEMA = _get("DB_SCHEMA", "agp")
     # 容器内直连 pg-unified:5432（双网络 agp_default）；本地调试可 DB_HOST=127.0.0.1
-    DSN = _get(
-        "DB_DSN",
-        f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}")
+    # TASK-046: DB_DSN 为空（未配置或 deploy 脚本置空 DB_DSN= 防旧值生效）时，
+    # 回退到 DB_HOST/DB_USER/AGP_DB_PASSWORD 组件构造——os.environ.get 对
+    # "DB_DSN="（空值）返回 "" 而非 fallback，必须显式判空。
+    DSN = (_get("DB_DSN", "")
+           or f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}")
 
     @property
     def effective_sqlite_path(self) -> str:

@@ -1,5 +1,10 @@
 name: Deploy to GCP VM
 
+# TASK-046（1.5.0）：部署逻辑全部下沉到 scripts/gcp_deploy.sh（版本化、可本地测试），
+# 本 workflow 只负责把 GitHub secret（ENV_FILE）注入 GCP 宿主并调用脚本：
+#   - DB 决策（默认 sqlite / postgres 探测→复用→自建幂等）
+#   - 数据卷属主防御（chown 1000:1000，无权限则 chmod 777 兜底）
+#   - 部署后健康检查（≤120s）+ 失败诊断输出（CI 日志 = 第一诊断现场）
 on:
   push:
     branches:
@@ -19,23 +24,21 @@ jobs:
           host: ${{ secrets.GCP_VM_IP }}
           username: ${{ secrets.GCP_VM_USER }}
           key: ${{ secrets.GCP_SSH_PRIVATE_KEY }}
-          script: |
-            set -e
-            DEPLOY_DIR="/home/partners/app/k-agent"
-
-            if [ ! -d "$DEPLOY_DIR/.git" ]; then
-              echo "Cloning repository..."
-              git clone https://github.com/${{ github.repository }}.git $DEPLOY_DIR
-            fi
-
-            cd $DEPLOY_DIR
-            echo "Pulling latest changes..."
-            git fetch origin main
-            git reset --hard origin/main
-
-            # 写入生产环境环境变量
-            echo "${{ secrets.ENV_FILE }}" > src/.env
-
-            # 构建并重新启动容器
-            docker compose down --remove-orphans
-            docker compose up -d --build
+          # |- 去掉公共缩进：heredoc 定界符必须顶格（bash 语法要求），
+          # 且 <<'EOF' 引号定界符 = 内容完全按字面写入、零 shell 解释
+          script: |-
+            # 注入 ENV_FILE secret 到宿主临时文件。
+            # 用"引号定界符 heredoc"（<<'AGP_ENVFILE_EOF'）：内容完全按字面写入，
+            # 不做任何 shell 解释——多行 / 单引号 / 双引号 / $ / 反引号 均安全。
+            # 定界符选一个 .env 文件不可能出现的行，避免误截断。
+            # 文件 600，用完即删，内容永不回显（CI 日志脱敏）。
+            mkdir -p /home/partners/app/k-agent
+            ENV_TMP="$(mktemp /home/partners/.envfile.XXXXXX)"
+            chmod 600 "$ENV_TMP"
+            trap 'rm -f "$ENV_TMP"' EXIT
+            cat > "$ENV_TMP" <<'AGP_ENVFILE_EOF'
+            ${{ secrets.ENV_FILE }}
+            AGP_ENVFILE_EOF
+            ENV_FILE_CONTENT="$(cat "$ENV_TMP")" \
+            DEPLOY_DIR=/home/partners/app/k-agent \
+            bash "$DEPLOY_DIR/scripts/gcp_deploy.sh"
