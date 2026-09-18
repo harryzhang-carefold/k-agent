@@ -39,8 +39,15 @@ RUN mkdir -p /home/hermes/.local/bin && \
 # 目录写入的文件会是 root:root，反噬宿主 hermes 用户的读写。uid/gid 固定
 # 1000 与本服务器宿主一致（单机部署场景；换主机时按宿主 hermes 用户调整）。
 # 建用户 + 切 USER 必须在 COPY 代码之前，保证 /app 属主为 hermes。
+# T-AGP-NAMEDVOL（1.5.x）：预先创建 /app/data 并一并 chown 给 hermes（uid 1000）。
+# 原因：sqlite 数据文件写 /app/data/agp.db（compose 环境变量 SQLITE_PATH 固定），
+# 而 /app/data 默认由 named volume agpdata 挂载。named volume 首次挂载时，Docker
+# 会把镜像里同路径目录的内容（含属主）复制进卷——因此必须让镜像内 /app/data
+# 属主 = hermes，否则卷以 root:root 挂载 → 容器以 uid 1000 运行无法写入 →
+# sqlite fail-fast 退出。bind 卷（./src/data 覆盖）不受此影响（宿主目录已存在）。
 RUN groupadd -g 1000 hermes 2>/dev/null; useradd -u 1000 -g 1000 \
     -d /home/hermes -s /bin/bash hermes 2>/dev/null; \
+    mkdir -p /app/data && \
     chown -R 1000:1000 /home/hermes/.local /app
 USER hermes
 

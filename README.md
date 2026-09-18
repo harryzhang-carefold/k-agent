@@ -139,7 +139,7 @@ tests/           pytest 套件（auth/agents/chat/rag/memory/mcp/longtext/ws）
 **SQLite（默认，零外部依赖，clone 即跑）**
 - 首次启动 `init_db()` 自动 `executescript(src/core/schema_sqlite.sql)` 幂等建表（20 表，全部带 `IF NOT EXISTS`）+ 种子数据，无需任何外部服务。
 - 方言原生支持：`?` 占位符、`datetime('now')`、`INSERT OR IGNORE`（不走 `_to_pg` 翻译）。
-- 数据落 `src/data/agp.db`（compose 挂卷 `./src/data:/app/data` 持久化，重启不丢）。
+- 数据落 named volume `agpdata`（compose 声明 `agpdata:/app/data`，持久化，重启/重建不丢；宿主物理位置 `docker volume inspect agp_agpdata`）。
 
 **PostgreSQL（可选，`DB_BACKEND=postgres`）**
 | 变量 | 默认值 | 说明 |
@@ -173,7 +173,7 @@ tests/           pytest 套件（auth/agents/chat/rag/memory/mcp/longtext/ws）
 | 镜像 | `agp-platform:1.4.0`（build: `./src/Dockerfile`, python:3.12-slim；阶段六含 Hermes Agent 双后端接入。回滚锚点 `1.3.0`/`1.2.0-dual` 保留） |
 | 容器名 | `agp-app`，`restart: unless-stopped` |
 | 端口 | `8099:8099` |
-| 卷 | `./src/data:/app/data`（持久化 `agp.db`，sqlite 模式重启不丢数据）；**Hermes（可选）**: `/home/hermes/.hermes:/home/hermes/.hermes`（宿主 hermes 运行时：venv + profiles + .env）+ `/home/hermes/.local/share/uv:/home/hermes/.local/share/uv`（venv python 符号链接目标）。未挂载的环境 hermes 功能优雅 503，custom 不受影响 |
+| 卷 | `agpdata:/app/data`（named volume，持久化 `agp.db`，sqlite 模式重启/重建不丢；**无需 chown 宿主目录**，属主由 Docker 管理，容器内 uid 1000 可直接写）；**Hermes（可选）**: `/home/hermes/.hermes:/home/hermes/.hermes`（宿主 hermes 运行时：venv + profiles + .env）+ `/home/hermes/.local/share/uv:/home/hermes/.local/share/uv`（venv python 符号链接目标）。未挂载的环境 hermes 功能优雅 503，custom 不受影响。显式 bind 卷用户见下方「从 bind 卷迁移到 named volume」 |
 | 网络 | 默认（sqlite）不需要外部网络；PG 模式叠加 `docker-compose.pg.yml` 接外部网络 `agp_default`（直连 pg-unified） |
 | 资源 | `mem_limit: 512m`，`cpus: 1.0` |
 | healthcheck | 每 15s 探 `/healthz`（start_period 20s） |
@@ -214,7 +214,7 @@ sg docker -c 'cd 02-development && ./deploy.sh'
 
 `deploy.sh` 的行为（全程 `[deploy]` 日志前缀）：
 
-1. **自动替换已存在容器**：先停止并删除已存在的 `agp-app`（兼容两种来源——手工 `docker run` 创建、无 compose 标签的旧容器，以及 compose 项目 `agp` 的遗留容器，含 Stopped 状态），再 `docker compose up -d --build` 创建启动新容器。**数据在卷（`./src/data/agp.db`）/ pg-unified 的 `agp` schema 中，重建不会丢失。**
+1. **自动替换已存在容器**：先停止并删除已存在的 `agp-app`（兼容两种来源——手工 `docker run` 创建、无 compose 标签的旧容器，以及 compose 项目 `agp` 的遗留容器，含 Stopped 状态），再 `docker compose up -d --build` 创建启动新容器。**数据在 named volume `agpdata`（sqlite）/ pg-unified 的 `agp` schema（PG）中，重建不会丢失。**
 2. 模式选择：`./deploy.sh`（默认 auto：`.env` 为 `DB_BACKEND=postgres` 时自动叠加 `docker-compose.pg.yml`，否则纯 sqlite）/ `./deploy.sh pg`（显式 PG 模式，先做 pg-unified + `agp_default` 网络预检，缺失时打印明确指引而非静默失败）/ `./deploy.sh sqlite`（纯 SQLite）。
 3. 健康检查（`/healthz`，重试 ≤30s）+ 打印最终状态（`docker compose ps`、compose 标签、健康状态、数据源）。
 
@@ -236,6 +236,39 @@ open  http://localhost:8099/            # 前端 SPA，admin / <SEED_PASSWORD> �
 ```
 
 常用运维：`docker compose logs -f`、`docker compose ps`、`docker compose down`（保留卷数据）。
+
+### 从 bind 卷迁移到 named volume（旧部署升级，T-AGP-NAMEDVOL）
+
+**背景**：1.5.0 默认把 sqlite 数据从 bind 卷 `./src/data:/app/data` 改为 named volume
+`agpdata`（全名 `agp_agpdata`），消除「新机器宿主目录属主非 1000 → 容器 uid 1000
+不可写 → sqlite fail-fast」的坑（此前每台机器都要记得 `sudo chown 1000:1000 <宿主目录>`）。
+named volume 由 Docker 管理属主（首次挂载把镜像内已 chown 1000 的 `/app/data` 复制进卷），
+**无需 chown**。
+
+- **全新部署（无旧 `./src/data`）**：`docker compose up -d --build` 即自动建 named volume
+  并初始化（空库，首次启动建表 + 种子）。无需任何额外步骤。
+- **已有 bind 卷数据的机器（`./src/data/agp.db` 存在）**：先 `docker compose down`（保留
+  旧数据），再把旧库拷进 named volume，一条命令（在本目录 `02-development` 下执行）：
+
+  ```bash
+  docker compose down
+  # 关键：alpine cp 以 root 运行，必须 chown 1000，否则 agp.db 属 root →
+  # 容器 uid 1000 不可写 → sqlite fail-fast（实测）。
+  docker run --rm -v agp_agpdata:/data -v $(pwd)/src/data:/old:ro \
+    alpine sh -c 'cp /old/agp.db /data/ && chown -R 1000:1000 /data'
+  docker compose up -d --build
+  ```
+
+  之后启动的 `agp-app` 读到的就是旧数据（旧 agent 仍在）。
+
+- **显式 bind 卷用户（保留 `./src/data`）**：如需继续用 bind 卷，用外部 `-f` override
+  覆盖回 `./src/data:/app/data`（例如自备 `docker-compose.override.yml` 或 `-f` 文件）——
+  此时行为不变，**bind 卷的宿主目录属主由用户自理**（`chown 1000:1000 src/data`，
+  无权限则 `chmod 777` 兜底，见 `scripts/gcp_deploy.sh` 的属主防御）。named volume 默认
+  不影响这条路径。
+
+- **PG 模式不受影响**：`DB_BACKEND=postgres` 时不读 sqlite 文件，`agpdata` 卷闲置。
+
 
 ### 数据库自动决策（1.5.0，GCP 云端部署）
 
