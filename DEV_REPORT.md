@@ -2325,3 +2325,88 @@ $ git push origin main
 - RISK-015：自测容器一律 docker run 独立名+端口（t053-pg:8250），未从外部目录起项目 compose 同名容器；线上 agp-app/pg-unified agp schema/gw-nginx 全程未动（agp_user search_path 首跑误触已立即恢复并核验）。
 - 临时文件全 05-temp/t053/（venv/测试/demo server/env/日志），零 /tmp。
 - 不引入新依赖（httpx 既有）；未 push、未 merge main、未打 tag（终审后由 TASK-056 执行）。
+
+---
+
+# TASK-054 · 迭代4 前端 + 文档：ext.js 传输类型两态表单 + 列表标记 + README/DEV_REPORT（2026-09-18，章北海，t_6c502090）
+
+## 1. 实现说明（对照任务书 T-AGP-MCP-HTTP.md §设计 4 前端 + §5 文档）
+
+在 TASK-053 后端（`7cc3f1d`，feat/mcp-http）之上继续。前端 `src/static/ext.js`（原生 JS，无构建）：
+
+### 1.1 MCP 表单传输类型两态
+- 表单顶部新增**传输类型下拉** `#mcpf-transport`（`stdio` / `http`），默认 `stdio`（新建）或按行 `transport` 回显（编辑）。
+- **stdio 态**：原有 `command` / `args` / `env` 键值对**原样不动**（零回归，字节级与旧实现一致）。
+- **http 态**：`URL` 输入（`#mcpf-url`，Streamable HTTP 端点）+ `headers` 键值对（复用现有 env 键值对组件样式，新增 `_hdrRow`/`extAddHdrRow`）。
+- 两态区由 `#mcp-stdio-wrap` / `#mcp-http-wrap` 包裹，`extSwitchMcpTransport()` 仅切换 `hidden` 显隐、**不清空已输入值**（来回切换不丢数据）。
+- `extSaveMcp()` 按当前 transport 组装提交体：http 态 `{name, command:"", args:[], env:{}, transport:"http", url, headers:{k:v}, enabled}`；stdio 态 `{name, command, args, env, transport:"stdio", url:"", headers:{}, enabled}`（与 TASK-053 提示的前端对接点一致）。前端再做一次必填前置校验（http 无 url / stdio 无 command → 表单内报错），后端 400 兜底。
+
+### 1.2 列表传输标记
+- 列表行名称旁加 `_mcpTransportBadge()`：`http` → `tag acc`（蓝）；`stdio` → `tag`（灰）。读 `row.transport`（存量行后端已归一为 stdio）。
+- 端点列：stdio 显示 `command args`；http 显示 `url`。计数列：stdio 显示 `env N 项`，http 显示 `headers N 项`。
+
+### 1.3 编辑回显 + tools 测试
+- `extEditMcp()` 打开表单时按行 `transport` 预选下拉并显隐对应区；http 行回显 `url` + `headers`，stdio 行回显 `command`/`args`/`env`。
+- `extToggleMcp()`（启停）PUT 全量覆盖时补齐 `transport`/`url`/`headers`（避免 PUT 全量覆盖把新字段冲掉）。
+- `tools/list` 与 `call` 按钮**对 http server 同样可用**（`extMcpTools`/`extMcpCall` 无需区分，后端 `GET /api/ext/mcp/{id}/tools` 已按行 transport 分流）。
+
+## 2. 改动文件清单
+| 文件 | 改动 |
+|---|---|
+| `src/static/ext.js` | MCP 表单传输两态（下拉 + stdio/http 两区显隐）+ `_mcpTransportBadge` 列表标记 + 端点/计数列按 transport 区分 + 编辑回显 + `extToggleMcp` 补齐三字段 + `MCP_TIP` 文案更新（双传输 + http 示例）+ 暴露 `extSwitchMcpTransport`/`extAddHdrRow` |
+| `README.md` | 新增 §3.9「MCP 服务器注册（stdio / HTTP 双传输）」两种注册示例（stdio demo + http 远程，含 headers 鉴权用途）+ 功能特性表 MCP 行更新 + 架构图 mcp/ 行更新 |
+
+## 3. 自测证据（RISK-015 隔离，全程未动线上 agp-app:8099 / pg-unified / gw-nginx）
+
+**隔离环境**（docker run 独立名 + 独立端口，独立网络 `t054-net`）：
+- `t054-app`（`agp-platform:t054`，本分支构建，含本次前端 + t053 后端）：`8614:8099`，named volume `t054_agpdata`，sqlite 模式。
+- `t054-mcp`（`python:3.12-slim`，stdlib 最小 Streamable HTTP MCP server `05-temp/t054/mcp_http_server.py`）：`8901:8900`，实现 initialize(JSON+Mcp-Session-Id) / tools/list(**SSE**) / tools/call(JSON) / 可选 401。
+- 临时文件全在 `05-temp/t054/`（env/测试脚本/venv/日志/证据），零 /tmp。
+
+### 3.1 API 级（宿主 python 经 :8614 打隔离 app，`05-temp/t054/api_test.py`）— **13/13 PASS**
+| # | 用例 | 结果 |
+|---|---|---|
+| 1 | seed demo 行 transport=stdio（存量零回归） | PASS |
+| 2 | 创建 http server（transport=http + url + headers） | PASS |
+| 3-6 | GET 回显 transport=http / url / headers / command 空串 | PASS |
+| 7 | **http tools/list 端到端**（app→mcp server，返回 get_time+echo_msg，SSE 响应） | PASS |
+| 8 | **http tools/call get_time 端到端**（真实返回时间字符串） | PASS |
+| 9 | stdio demo tools/list 零回归 | PASS |
+| 10 | PUT 编辑 headers 全量覆盖回显 | PASS |
+| 11 | stdio 无 command → 400 | PASS |
+| 12 | http 非法 url（not-a-url）→ 400 | PASS |
+| 13 | http→stdio 传输切换 PUT 全量回显 | PASS |
+
+### 3.2 前端 DOM（Playwright 真实 Chromium 驱动隔离 app :8614，`05-temp/t054/dom_test.py`）— **18/18 PASS**
+| # | 用例 | 结果 |
+|---|---|---|
+| 1-2 | 列表标记：http 行有 `http` badge / stdio demo 行有 `stdio` badge | PASS |
+| 3-4 | 新建表单默认 stdio：command/args/env 可见，url/headers 隐藏 | PASS |
+| 5-7 | 切到 http：URL 可见 / command-args-env 隐藏 / headers 可见 | PASS |
+| 8-9 | 切回 stdio：command 可见 / url 隐藏 | PASS |
+| 10 | **保存 http 表单 → 列表出现新行 + http badge**（真实 POST 落库 + 重绘） | PASS |
+| 11-14 | **编辑 http server 表单回显** transport=http / url / headers(Authorization=Bearer ui-token) / http 区可见 | PASS |
+| 15-17 | 编辑 stdio(demo) 表单回显 transport=stdio / command=python3 / stdio 区可见 | PASS |
+| 18 | **tools/list 按钮对 http server 可用**（走后端 http 分流，真实返回 get_time+echo_msg） | PASS |
+
+- 页面 console 仅 1 条 404（favicon.ico，与本功能无关，已核实 `curl /favicon.ico` = 404 为全站常态）；无 JS 报错。
+- 两态切换、列表标记、保存后回显三项自测要求**全部满足**（任务书 §自测要求）。
+
+### 3.3 零回归核对
+- ext.js 中 **Skills 区 / 长文本 4 策略区** 字节级与原实现一致（`diff` 逐段比对 IDENTICAL），零回归。
+- 大括号/小括号/方括号配平核对通过（125/125、483/483、27/27）。
+
+## 4. 已知问题
+- 无阻塞级。`headers`/`env` 键值对组件为单行 key/value 输入（复用既有样式），与 TASK-030 既有交互一致；多 header 用「＋ 加一行」动态增删。
+- 前端对 http URL 不做本地格式强校验（交给后端 400 兜底），错误信息经 `#mcpf-err` 透传（含后端 message）。
+
+## 5. 部署
+- 本卡为**前端 + 文档代码交付**（feat/mcp-http 分支，未 merge/push），部署随 TASK-056 终审后 1.6.0 统一进行。
+- 自测容器（`t054-app:8614` / `t054-mcp:8901`）+ 临时网络 `t054-net` + 镜像 `agp-platform:t054` 均为**自测临时资源**，任务收尾拆除，无新增常驻组件/端口/卷——**SERVER_REGISTRY.md 无需新增登记**（与 TASK-053 同口径）。
+- 线上 agp-app(1.4.0/8099) / pg-unified / gw-nginx 全程未动。
+
+## 6. 铁律核对
+- RISK-015：自测容器一律 docker run 独立名 + 端口（t054-app:8614 / t054-mcp:8901），独立网络 t054-net，未从外部目录起项目 compose 同名容器；线上 agp-app/pg-unified/gw-nginx 全程未动。
+- 临时文件全 05-temp/t054/，零 /tmp。
+- 未引入新依赖（前端纯原生 JS；测试 Playwright 装在 05-temp venv，不进镜像/requirements）。
+- 未 push、未 merge main、未打 tag（终审后由 TASK-056 执行）。

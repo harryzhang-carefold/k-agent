@@ -3,10 +3,16 @@
  *
  * 职责：
  *   - Skills：列表(名称/描述/长度/更新时间, 可搜索) + 新建/编辑 + 删除(确认) + 内容查看/编辑 + 上传导入(.md/.txt/zip)
- *   - MCP   ：列表(enabled 开关) + 新建/编辑(command/args/env 键值对) + 删除 + 保留 tools/list 与 call 测试
+ *   - MCP   ：列表(传输标记 stdio/http + enabled 开关) + 新建/编辑(传输两态表单：
+ *             stdio=command/args/env；http=url/headers) + 删除 + 保留 tools/list 与 call 测试
  *   - Plugins / 长文本4策略 / HITL：保持原有只读能力
  *
  * 权限：无 ext:manage 时写入入口禁用（canManage() 守卫）。
+ *
+ * TASK-054 迭代4：MCP 表单增加传输类型两态（stdio / HTTP，Streamable HTTP），
+ *   http 态 = URL + headers 键值对；stdio 态 = 原有 command/args/env 零回归。
+ *   列表行增加传输标记（stdio 灰 / http 蓝 badge）。tools/list 与 call 按钮
+ *   对两种传输通用（后端按行 transport 分流，/api/ext/mcp/{id}/tools 无需前端区分）。
  */
 (function () {
   'use strict';
@@ -28,20 +34,25 @@
       '<span class="tip-box" role="tooltip">' + esc(content) + '</span></span>';
   }
 
-  // 文案与 src/mcp/mcp_client.py（stdio only, LSP Content-Length 帧）+
+  // 文案对齐 src/mcp/mcp_client.py（stdio + Streamable HTTP 双传输）+
   // src/mcp/mcp_server_demo.py（容器内 /app/mcp/mcp_server_demo.py，工具
-  // get_time/get_patient_demo；脚本不解析任何 CLI 参数，故不举 --verbose）一致
+  // get_time/get_patient_demo；脚本不解析任何 CLI 参数，故不举 --verbose）。
+  // TASK-054 迭代4：http 传输（MCP Streamable HTTP：JSON-RPC over POST 单端点，
+  // 响应 JSON 或 SSE 流，Mcp-Session-Id 会话头）与 stdio 并存。
   const MCP_TIP = [
-    'MCP Server：本地可执行命令（stdio JSON-RPC），平台 spawn 它并用 LSP Content-Length 帧通信。仅支持 stdio，无 HTTP/SSE。',
+    'MCP Server 两种传输（可并存）：',
+    '· stdio：本地可执行命令，平台 spawn 子进程用 LSP Content-Length 帧 JSON-RPC 通信。',
+    '· http（Streamable HTTP）：远程/容器化 MCP server 的 HTTP 端点，JSON-RPC over POST 单端点（响应可为 JSON 或 SSE 流），自动处理 Mcp-Session-Id 会话头；无需本地可执行程序。',
     '',
-    '配置步骤：',
-    '① 唯一名称 → ② command（可执行程序，如 python3 / node / 绝对路径）→ ③ args（脚本路径+参数）→ ④ 可选 env 键值对（注入子进程环境变量）→ ⑤ 勾 enabled → 保存',
+    '配置步骤（stdio）：① 唯一名称 → ② 传输=stdio → ③ command（可执行程序，如 python3 / node / 绝对路径）→ ④ args（脚本路径+参数）→ ⑤ 可选 env 键值对（注入子进程环境变量）→ ⑥ 勾 enabled → 保存',
+    '配置步骤（http）：① 唯一名称 → ② 传输=http → ③ URL（http(s) 端点地址，如 http://host:port/mcp）→ ④ 可选 headers 键值对（自定义请求头，如 Authorization: Bearer xxx）→ ⑤ 勾 enabled → 保存',
     '',
-    '真实示例（容器内可跑，demo 为仓库内置）：',
+    '真实示例（stdio，容器内可跑，demo 为仓库内置）：',
     '· 名称 demo，command python3，args /app/mcp/mcp_server_demo.py —— 即当前已存在的内置 demo server，保存后点 tools/list 可见 get_time / get_patient_demo 两个工具',
-    '· 再建一个：command python3，args /app/mcp/mcp_server_demo.py，env LOG_LEVEL=debug（env 注入子进程；demo 脚本不消费该变量，仅演示 env 配置方式）',
+    'http 示例（远程 server，真实端点地址）：',
+    '· 名称 remote-weather，URL http://10.0.0.5:8900/mcp，headers Authorization=Bearer <token> —— 接入远程 MCP server（如容器内起的 Streamable HTTP server）',
     '',
-    '提示：保存后点 tools/list 验证连接（测试会真实启动子进程）；被 agent 引用的 server 删除会 409，需先解绑。',
+    '提示：保存后点 tools/list 验证连接（stdio 会真实启动子进程；http 会真实 POST 到端点，超时 10s）；被 agent 引用的 server 删除会 409，需先解绑。',
   ].join('\n');
 
   // 文案逐字对齐 src/services/longtext.py 头部 docstring（1-11 行）
@@ -70,7 +81,7 @@
         ? '✓ 你有 <span class="tag acc">ext:manage</span> 权限，可增删改。'
         : '只读模式：你当前没有 <span class="tag warn">ext:manage</span> 权限，写入入口已禁用（后端同样 403）。') + '</div>' +
       '<div class="panel">' + renderSkillsPanel(M) + '</div>' +
-      '<div class="panel"><h3>MCP Servers（stdio JSON-RPC · 内置 demo 真实进程）' + _tipBox(MCP_TIP) + '</h3>' +
+      '<div class="panel"><h3>MCP Servers（stdio JSON-RPC / HTTP Streamable 双传输 · 内置 demo 真实进程）' + _tipBox(MCP_TIP) + '</h3>' +
         renderMcpPanel(M) + '</div>' +
       '<div class="panel"><h3>Plugins（内置可调用能力 · 只读）</h3>' +
         (pl.plugins || []).map(p =>
@@ -200,17 +211,17 @@
       '<div style="margin-top:8px">' +
         '<button class="primary" style="width:auto;padding:9px 20px" onclick="extDoUpload()">开始导入</button>' +
         '<button class="small" onclick="extCloseUpload()">取消</button></div>' +
-      '<div id="sk-upload-res"></div></div>';
+      '<div id="sk-up-res"></div></div>';
   }
   function extCloseUpload() { $('#sk-upload').classList.add('hidden'); $('#sk-upload').innerHTML = ''; }
 
   async function extDoUpload() {
     const fileInput = $('#sk-file');
     const files = fileInput.files;
-    if (!files || !files.length) { $('#sk-upload-res').innerHTML = '<div class="err">请选择至少一个文件</div>'; return; }
+    if (!files || !files.length) { $('#sk-up-res').innerHTML = '<div class="err">请选择至少一个文件</div>'; return; }
     const fd = new FormData();
     for (const f of files) fd.append('files', f);
-    const res = $('#sk-upload-res');
+    const res = $('#sk-up-res');
     res.innerHTML = '<div class="k">导入中…</div>';
     // api() 默认带 Content-Type: application/json，multipart 需要去掉（浏览器自动加 boundary）
     const headers = { 'Authorization': 'Bearer ' + (localStorage.getItem(TOKEN_KEY) || '') };
@@ -247,7 +258,7 @@
       '<div style="color:var(--ok)">✓ 完成：新增 ' + (c.created || 0) +
       ' · 跳过 ' + (c.skipped || 0) + ' · 失败 ' + (c.failed || 0) + '</div></div>' +
       '<div id="sk-up-detail"></div>';
-    const det = $('#sk-upload-res');
+    const det = $('#sk-up-res');
     det.innerHTML = html;
     const d = det.querySelector('#sk-up-detail');
     const part = (title, arr, color) => {
@@ -265,18 +276,33 @@
   }
 
   // ---------- MCP ----------
+  // TASK-054 迭代4：传输标记 badge（列表行内，紧跟名称）
+  function _mcpTransportBadge(transport) {
+    const t = (transport || 'stdio').toLowerCase();
+    return '<span class="tag ' + (t === 'http' ? 'acc' : '') + '">' +
+      (t === 'http' ? 'http' : 'stdio') + '</span>';
+  }
+
   function renderMcpPanel(M) {
     return (M ?
       '<div id="mcp-form" class="hidden"></div>' +
       '<div class="k" style="margin:6px 0">共 ' + _mcps.length + ' 个 server</div>' :
       '<div class="k" style="margin:6px 0">共 ' + _mcps.length + ' 个 server（只读）</div>') +
       (_mcps.length
-        ? '<table><tr><th>名称</th><th>命令</th><th>env</th><th>状态</th><th>操作</th><th>tools/call 输出</th></tr>' +
+        ? '<table><tr><th>名称 / 传输</th><th>端点 / 命令</th><th>env / headers</th><th>状态</th><th>操作</th><th>tools/call 输出</th></tr>' +
           _mcps.map(s => {
-            const args = (s.args || []).join(' ');
-            return '<tr><td><strong>' + esc(s.name) + '</strong><div class="k mono">#' + s.id + '</div></td>' +
-              '<td class="k mono">' + esc(s.command) + (args ? ' ' + esc(args) : '') + '</td>' +
-              '<td class="k">' + ((s.env && Object.keys(s.env).length) ? Object.keys(s.env).length + ' 项' : '—') + '</td>' +
+            const t = (s.transport || 'stdio').toLowerCase();
+            // stdio：显示 command args；http：显示 url（+ headers 项数）
+            const endpoint = (t === 'http')
+              ? esc(s.url || '')
+              : esc(s.command || '') + ((s.args && s.args.length) ? ' ' + esc(s.args.join(' ')) : '');
+            // env（stdio）/ headers（http）计数
+            const kv = (t === 'http') ? (s.headers || {}) : (s.env || {});
+            const kvLabel = (t === 'http') ? 'headers' : 'env';
+            return '<tr><td><strong>' + esc(s.name) + '</strong> ' + _mcpTransportBadge(t) +
+              '<div class="k mono">#' + s.id + '</div></td>' +
+              '<td class="k mono" style="word-break:break-all">' + endpoint + '</td>' +
+              '<td class="k">' + (Object.keys(kv).length ? kvLabel + ' ' + Object.keys(kv).length + ' 项' : '—') + '</td>' +
               '<td>' + (M
                 ? '<label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer">' +
                   '<input type="checkbox" class="mcp-toggle" data-id="' + s.id + '" ' + (s.enabled ? 'checked' : '') + ' onchange="extToggleMcp(' + s.id + ', this.checked)">' +
@@ -289,7 +315,7 @@
                 (M ? '<button class="danger" onclick="extDelMcp(' + s.id + ')">删除</button>' : '') +
               '</td><td id="mcp-out-' + s.id + '"></td></tr>';
           }).join('') +
-          '</table><div class="k">说明：MCP 测试按钮会真实启动 stdio 子进程（内置 demo）。' + (M ? ' 编辑表单需回传完整 name/command/args/env/enabled（后端全量覆盖）。' : '') + '</div>'
+          '</table><div class="k">说明：MCP 测试按钮会真实启动 stdio 子进程（内置 demo）或真实 POST 到 http 端点（Streamable HTTP，超时 10s）。' + (M ? ' 编辑表单需回传完整 name/transport/url/headers/command/args/env/enabled（后端全量覆盖）。' : '') + '</div>'
         : '<div class="k">（暂无 MCP server）</div>') +
       (M ? '<button class="small" onclick="extNewMcp()">＋ 新建 MCP Server</button>' : '');
   }
@@ -315,8 +341,18 @@
   async function extToggleMcp(id, enabled) {
     const s = _mcps.find(x => x.id === id);
     if (!s) return;
-    // PUT 是全量覆盖，需回传完整对象（仅改 enabled）
-    const body = { name: s.name, command: s.command, args: s.args || [], env: s.env || {}, enabled };
+    // PUT 是全量覆盖，需回传完整对象（含 transport/url/headers）
+    const t = (s.transport || 'stdio').toLowerCase();
+    const body = {
+      name: s.name,
+      command: t === 'http' ? '' : (s.command || ''),
+      args: (s.args || []),
+      env: (s.env || {}),
+      transport: t,
+      url: t === 'http' ? (s.url || '') : '',
+      headers: t === 'http' ? (s.headers || {}) : {},
+      enabled,
+    };
     try {
       await api('/api/ext/mcp/' + id, { method: 'PUT', body: JSON.stringify(body) });
       await loadExt();
@@ -333,26 +369,87 @@
     _mcpEditId = id; _showMcpForm();
   }
 
+  // TASK-054 迭代4：stdio 传输区内容（command/args/env 键值对，原样零回归）。
+  // 返回纯内容串，外层由 _showMcpForm 的 #mcp-stdio-wrap 包裹并按 transport 显隐。
+  function _mcpStdioSection(s) {
+    const env = s ? (s.env || {}) : {};
+    const envRows = Object.entries(env).map(([k, v]) => _envRow(k, v)).join('') || _envRow('', '');
+    return '<div class="row">' +
+      '<div><label>命令 command（stdio 必填）</label><input id="mcpf-cmd" value="' + (s ? esc(s.command || '') : '') + '" placeholder="python 或 node 或绝对路径"></div>' +
+    '</div>' +
+    '<label>args（空格分隔，或 JSON 数组）</label>' +
+    '<input id="mcpf-args" value="' + (s ? esc((s.args || []).join(' ')) : '') + '" placeholder="脚本路径 --flag（多个空格分隔）">' +
+    '<label>env（键值对，动态增删，注入子进程环境变量）</label>' +
+    '<div id="mcpf-env">' + envRows + '</div>' +
+    '<button class="small" onclick="extAddEnvRow()">＋ 加一行 env</button>';
+  }
+
+  // TASK-054 迭代4：http 传输区内容（URL + headers 键值对，Streamable HTTP 端点）。
+  // 返回纯内容串，外层由 _showMcpForm 的 #mcp-http-wrap 包裹并按 transport 显隐。
+  function _mcpHttpSection(s) {
+    const headers = s ? (s.headers || {}) : {};
+    const headerRows = Object.entries(headers).map(([k, v]) => _hdrRow(k, v)).join('') || _hdrRow('', '');
+    return '<label>URL（http 必填，Streamable HTTP 端点地址）</label>' +
+      '<input id="mcpf-url" value="' + (s ? esc(s.url || '') : '') + '" placeholder="http://host:port/mcp 或 https://...（需 http/https + host）">' +
+      '<label>headers（键值对，可选自定义请求头，如 Authorization）</label>' +
+      '<div id="mcpf-headers">' + headerRows + '</div>' +
+      '<button class="small" onclick="extAddHdrRow()">＋ 加一行 header</button>' +
+      '<div class="k" style="margin-top:6px">提示：http 传输无需本地 command；headers 值原样发送（如 Authorization: Bearer &lt;token&gt;）。超时默认 10s（connect 5s）。</div>';
+  }
+
+  function _envRow(k, v) {
+    return '<div class="row mcpf-env-row" style="margin-bottom:6px">' +
+      '<div><input class="mcpf-env-k" placeholder="KEY" value="' + esc(k) + '"></div>' +
+      '<div><input class="mcpf-env-v" placeholder="value" value="' + esc(v) + '"></div>' +
+      '<div style="flex:0 0 auto;align-self:flex-end"><button class="small" onclick="this.closest(\'.mcpf-env-row\').remove()">删</button></div>' +
+      '</div>';
+  }
+  function extAddEnvRow() { const e = $('#mcpf-env'); if (e) e.insertAdjacentHTML('beforeend', _envRow('', '')); }
+
+  function _hdrRow(k, v) {
+    return '<div class="row mcpf-hdr-row" style="margin-bottom:6px">' +
+      '<div><input class="mcpf-hdr-k" placeholder="Header-Name" value="' + esc(k) + '"></div>' +
+      '<div><input class="mcpf-hdr-v" placeholder="value（如 Bearer xxx）" value="' + esc(v) + '"></div>' +
+      '<div style="flex:0 0 auto;align-self:flex-end"><button class="small" onclick="this.closest(\'.mcpf-hdr-row\').remove()">删</button></div>' +
+      '</div>';
+  }
+  function extAddHdrRow() { const h = $('#mcpf-headers'); if (h) h.insertAdjacentHTML('beforeend', _hdrRow('', '')); }
+
+  // TASK-054 迭代4：传输切换（stdio / http 两态表单）。
+  // 切到 http → 隐藏 stdio 区、显示 http 区（URL+headers）；
+  // 切到 stdio → 隐藏 http 区、显示 stdio 区（command/args/env）。
+  // 仅切显示，不清空已输入值（用户来回切换不丢数据）。
+  function extSwitchMcpTransport() {
+    const sel = $('#mcpf-transport');
+    const t = sel ? sel.value : 'stdio';
+    const stdio = $('#mcp-stdio-wrap');
+    const http = $('#mcp-http-wrap');
+    if (stdio) stdio.classList.toggle('hidden', t !== 'stdio');
+    if (http) http.classList.toggle('hidden', t !== 'http');
+  }
+
   function _showMcpForm() {
     const s = _mcpEditId ? _mcps.find(x => x.id === _mcpEditId) : null;
+    const t = s ? (s.transport || 'stdio').toLowerCase() : 'stdio';
     const f = $('#mcp-form');
     f.classList.remove('hidden');
-    // env 键值对行
-    const env = s ? (s.env || {}) : {};
-    const envRows = Object.entries(env).map(([k, v], i) =>
-      _envRow(k, v)).join('') || _envRow('', '');
+    // 两态区：按当前 transport 决定哪个可见（stdio 默认）
+    const stdioVisible = t === 'stdio';
     f.innerHTML =
       '<div class="panel" style="background:var(--panel2);margin-top:10px">' +
       '<h4>' + (s ? '编辑 MCP Server #' + s.id : '新建 MCP Server') + '</h4>' +
       '<div class="row">' +
         '<div><label>名称（必填，唯一）</label><input id="mcpf-name" value="' + (s ? esc(s.name) : '') + '"></div>' +
-        '<div><label>命令 command（必填）</label><input id="mcpf-cmd" value="' + (s ? esc(s.command) : '') + '" placeholder="python 或 node"></div>' +
+        '<div style="flex:0 0 220px"><label>传输类型</label>' +
+          '<select id="mcpf-transport" onchange="extSwitchMcpTransport()">' +
+            '<option value="stdio"' + (t === 'stdio' ? ' selected' : '') + '>stdio（本地命令）</option>' +
+            '<option value="http"' + (t === 'http' ? ' selected' : '') + '>http（Streamable HTTP 端点）</option>' +
+          '</select></div>' +
       '</div>' +
-      '<label>args（空格分隔，或 JSON 数组）</label>' +
-      '<input id="mcpf-args" value="' + (s ? esc((s.args || []).join(' ')) : '') + '" placeholder="脚本路径 --flag（多个空格分隔）">' +
-      '<label>env（键值对，动态增删）</label>' +
-      '<div id="mcpf-env">' + envRows + '</div>' +
-      '<button class="small" onclick="extAddEnvRow()">＋ 加一行 env</button>' +
+      // stdio 区（command/args/env）— 按 transport 显隐
+      '<div' + (stdioVisible ? '' : ' class="hidden"') + ' id="mcp-stdio-wrap">' + _mcpStdioSection(s) + '</div>' +
+      // http 区（url/headers）— 按 transport 显隐
+      '<div' + (stdioVisible ? ' class="hidden"' : '') + ' id="mcp-http-wrap">' + _mcpHttpSection(s) + '</div>' +
       '<div class="row" style="margin-top:10px;align-items:center">' +
         '<div style="flex:0 0 auto"><label style="display:inline-flex;gap:6px;align-items:center;margin:0">' +
           '<input type="checkbox" id="mcpf-enabled" ' + (s && !s.enabled ? '' : 'checked') + '> enabled</label></div></div>' +
@@ -363,41 +460,48 @@
     f.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }
 
-  function _envRow(k, v) {
-    return '<div class="row mcpf-env-row" style="margin-bottom:6px">' +
-      '<div><input class="mcpf-env-k" placeholder="KEY" value="' + esc(k) + '"></div>' +
-      '<div><input class="mcpf-env-v" placeholder="value" value="' + esc(v) + '"></div>' +
-      '<div style="flex:0 0 auto;align-self:flex-end"><button class="small" onclick="this.closest(\'.mcpf-env-row\').remove()">删</button></div>' +
-      '</div>';
-  }
-  function extAddEnvRow() { $('#mcpf-env').insertAdjacentHTML('beforeend', _envRow('', '')); }
-
   function extCloseMcpForm() { $('#mcp-form').classList.add('hidden'); $('#mcp-form').innerHTML = ''; }
 
   async function extSaveMcp() {
     const name = $('#mcpf-name').value.trim();
-    const command = $('#mcpf-cmd').value.trim();
-    const argsRaw = $('#mcpf-args').value.trim();
-    let args;
-    if (argsRaw) {
-      // 支持 JSON 数组或空格分隔
-      try {
-        const p = JSON.parse(argsRaw);
-        args = Array.isArray(p) ? p.map(String) : [argsRaw];
-      } catch (e) {
-        args = argsRaw.split(/\s+/);
-      }
-    } else args = [];
-    const env = {};
-    document.querySelectorAll('#mcpf-env .mcpf-env-row').forEach(row => {
-      const k = row.querySelector('.mcpf-env-k').value.trim();
-      const v = row.querySelector('.mcpf-env-v').value;
-      if (k) env[k] = v;
-    });
+    const transport = ($('#mcpf-transport') ? $('#mcpf-transport').value : 'stdio').trim().toLowerCase();
     const enabled = $('#mcpf-enabled').checked;
     if (!name) { $('#mcpf-err').textContent = '名称必填'; return; }
-    if (!command) { $('#mcpf-err').textContent = '命令 command 必填'; return; }
-    const body = { name, command, args, env, enabled };
+
+    let body;
+    if (transport === 'http') {
+      // http 态：url 必填；command/args/env 留空（后端按 http 行 command 存空串）
+      const url = ($('#mcpf-url') ? $('#mcpf-url').value.trim() : '');
+      if (!url) { $('#mcpf-err').textContent = 'URL 必填（http 传输需端点地址）'; return; }
+      const headers = {};
+      document.querySelectorAll('#mcpf-headers .mcpf-hdr-row').forEach(row => {
+        const k = row.querySelector('.mcpf-hdr-k').value.trim();
+        const v = row.querySelector('.mcpf-hdr-v').value;
+        if (k) headers[k] = v;
+      });
+      body = { name, command: '', args: [], env: {}, transport, url, headers, enabled };
+    } else {
+      // stdio 态：command 必填；url/headers 留空
+      const command = ($('#mcpf-cmd') ? $('#mcpf-cmd').value.trim() : '');
+      if (!command) { $('#mcpf-err').textContent = '命令 command 必填（stdio 传输）'; return; }
+      const argsRaw = ($('#mcpf-args') ? $('#mcpf-args').value.trim() : '');
+      let args;
+      if (argsRaw) {
+        try {
+          const p = JSON.parse(argsRaw);
+          args = Array.isArray(p) ? p.map(String) : [argsRaw];
+        } catch (e) {
+          args = argsRaw.split(/\s+/);
+        }
+      } else args = [];
+      const env = {};
+      document.querySelectorAll('#mcpf-env .mcpf-env-row').forEach(row => {
+        const k = row.querySelector('.mcpf-env-k').value.trim();
+        const v = row.querySelector('.mcpf-env-v').value;
+        if (k) env[k] = v;
+      });
+      body = { name, command, args, env, transport, url: '', headers: {}, enabled };
+    }
     try {
       if (_mcpEditId) await api('/api/ext/mcp/' + _mcpEditId, { method: 'PUT', body: JSON.stringify(body) });
       else await api('/api/ext/mcp', { method: 'POST', body: JSON.stringify(body) });
@@ -470,6 +574,7 @@
   window.extMcpTools = extMcpTools; window.extMcpCall = extMcpCall; window.extToggleMcp = extToggleMcp;
   window.extNewMcp = extNewMcp; window.extEditMcp = extEditMcp;
   window.extSaveMcp = extSaveMcp; window.extDelMcp = extDelMcp; window.extAddEnvRow = extAddEnvRow;
+  window.extAddHdrRow = extAddHdrRow; window.extSwitchMcpTransport = extSwitchMcpTransport;
   window.extCloseMcpForm = extCloseMcpForm;
   window.extCallPlugin = extCallPlugin; window.extLtRun = extLtRun; window.extLtPreprocess = extLtPreprocess;
 })();

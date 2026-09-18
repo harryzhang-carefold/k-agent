@@ -11,7 +11,7 @@
 | **缓存路由（5 策略）** | ① 图片 MD5 命中直返 ② 文本语义相似度 > 阈值命中直返 ③ 混合输入拆分 ④ 复杂任务拆分 ⑤ prefix caching — 全部真实实现，命中时 LLM 调用 = 0 |
 | **RAG 知识库** | 滑动窗口分块（2000 token、20% 重叠）→ 嵌入 → 余弦 top-k 检索 → 上下文拼入 prompt 左侧 |
 | **三层记忆** | L0 原始会话 / L1 缓存 / L2 立体图（双向属性图 + 每节点 B+ 树按日期/实体/过程/主题分桶），与 Agent 解耦的可插拔后端 |
-| **MCP** | stdio JSON-RPC 客户端（initialize → tools/list → tools/call），外部 MCP 进程配置表接入；内置插件注册表（get_time/mcp_call/echo）作为 tool 暴露给 LLM |
+| **MCP** | 双传输客户端（**stdio** JSON-RPC 子进程 + **http** Streamable HTTP 远程端点，`initialize → tools/list → tools/call` 同语义），外部 MCP server 配置表接入（`transport`/`url`/`headers` 字段）；内置插件注册表（get_time/mcp_call/echo）作为 tool 暴露给 LLM |
 | **长文本 4 策略** | Map-Reduce 提取 / 增量图构建 / 批判-精炼 / 确定性预处理（同名指标单位冲突强制"需人工复核"） |
 | **RBAC** | JWT HS256 + 13 权限 × 4 角色（admin/developer/user/viewer），路由级守卫 |
 | **工具管理（阶段四）** | Skills 管理（增删改/搜索/**上传导入** 单文件 .md/.txt/zip，**导入结果面板**显示「✓ 完成：新增 N·跳过 N·失败 N」+ 每项明细；BUG-006 已修复）+ MCP 管理（表单/env 键值对/启停/删除） |
@@ -45,7 +45,7 @@
                 │  embedding   │  上下文拼装    │  graph 属性图 │
                 │  (远程/哈希)  │               │  btree  B+树  │
                 ├──────────────┴───────────────┴───────────────┤
-                │  mcp/  stdio JSON-RPC 客户端 + plugins 注册表  │
+                │  mcp/  stdio+HTTP 双传输客户端 + plugins 注册表  │
                 │  services/longtext.py  长文本 4 策略           │
                 ├──────────────────────────────────────────────┤
                 │  core/db.py  双后端：aiosqlite(默认) | asyncpg │
@@ -177,6 +177,36 @@ tests/           pytest 套件（auth/agents/chat/rag/memory/mcp/longtext/ws）
 | 网络 | 默认（sqlite）不需要外部网络；PG 模式叠加 `docker-compose.pg.yml` 接外部网络 `agp_default`（直连 pg-unified） |
 | 资源 | `mem_limit: 512m`，`cpus: 1.0` |
 | healthcheck | 每 15s 探 `/healthz`（start_period 20s） |
+
+### 3.9 MCP 服务器注册（stdio / HTTP 双传输，1.6.0）
+
+MCP server 支持**两种传输**，可并存（`mcp_servers.transport` 字段，`'stdio'` / `'http'`）：
+
+- **stdio**：本地可执行命令。平台 spawn 子进程，用 LSP `Content-Length` 帧做 JSON-RPC。需 `command`（可执行程序）+ `args` + 可选 `env`。
+- **http（Streamable HTTP）**：远程/容器化 MCP server 的 HTTP 端点。JSON-RPC over POST 单端点，响应可为 JSON 或 SSE 流，自动处理 `Mcp-Session-Id` 会话头。**无需本地可执行程序**，只需 `url`（http(s) 端点地址）+ 可选 `headers`（自定义请求头，如 `Authorization`）。超时默认 10s（connect 5s）。
+
+校验矩阵（`POST`/`PUT /api/ext/mcp`）：`transport=http ⇒ url 非空且为合法 http(s) URL`（否则 400）；`transport=stdio ⇒ command 非空`（否则 400）；http 行 `command` 存空串（command 保持 stdio 专属语义）。
+
+**注册示例（两种传输）**：
+
+```bash
+# ① stdio 本地 demo（容器内置，保存后点 tools/list 可见 get_time / get_patient_demo）
+curl -s -X POST http://<host>:8099/api/ext/mcp \
+  -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
+  -d '{"name":"demo","command":"python3","args":["/app/mcp/mcp_server_demo.py"],
+       "env":{},"transport":"stdio","url":"","headers":{},"enabled":true}'
+
+# ② http 远程 server（Streamable HTTP 端点，如容器/云端起的远程 MCP server）
+#    headers 用于鉴权：Authorization 值为 "Bearer <token>"
+curl -s -X POST http://<host>:8099/api/ext/mcp \
+  -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
+  -d '{"name":"remote-weather","command":"","args":[],"env":{},
+       "transport":"http","url":"http://10.0.0.5:8900/mcp",
+       "headers":{"Authorization":"Bearer <remote-token>"},
+       "enabled":true}'
+```
+
+前端（MCP-Skills 页面）新建/编辑时选**传输类型**：`stdio`（本地命令）显示 command/args/env；`http`（Streamable HTTP 端点）显示 URL + headers 键值对。列表行带 `stdio` / `http` 传输标记；`tools/list` 测试按钮对两种传输通用（后端按行 `transport` 分流）。
 
 ## 4. 部署与启动
 
