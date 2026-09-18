@@ -170,7 +170,7 @@ tests/           pytest 套件（auth/agents/chat/rag/memory/mcp/longtext/ws）
 
 | 项 | 值 |
 |---|---|
-| 镜像 | `agp-platform:1.4.0`（build: `./src/Dockerfile`, python:3.12-slim；阶段六含 Hermes Agent 双后端接入。回滚锚点 `1.3.0`/`1.2.0-dual` 保留） |
+| 镜像 | `agp-platform:1.6.0`（build: `./src/Dockerfile`, python:3.12-slim；阶段六含 Hermes Agent 双后端接入，迭代4 含 MCP 双传输。回滚锚点 `1.5.0`/`1.4.0`/`1.3.0` 保留） |
 | 容器名 | `agp-app`，`restart: unless-stopped` |
 | 端口 | `8099:8099` |
 | 卷 | `agpdata:/app/data`（named volume，持久化 `agp.db`，sqlite 模式重启/重建不丢；**无需 chown 宿主目录**，属主由 Docker 管理，容器内 uid 1000 可直接写）；**Hermes（可选）**: `/home/hermes/.hermes:/home/hermes/.hermes`（宿主 hermes 运行时：venv + profiles + .env）+ `/home/hermes/.local/share/uv:/home/hermes/.local/share/uv`（venv python 符号链接目标）。未挂载的环境 hermes 功能优雅 503，custom 不受影响。显式 bind 卷用户见下方「从 bind 卷迁移到 named volume」 |

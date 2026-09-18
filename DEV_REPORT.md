@@ -2410,3 +2410,80 @@ $ git push origin main
 - 临时文件全 05-temp/t054/，零 /tmp。
 - 未引入新依赖（前端纯原生 JS；测试 Playwright 装在 05-temp venv，不进镜像/requirements）。
 - 未 push、未 merge main、未打 tag（终审后由 TASK-056 执行）。
+
+
+---
+
+# TASK-056 · 迭代4 PM 独立黑盒终审 + merge main + push + tag 1.6.0 + 交付（2026-09-18，褚岩，t_767cd0af）
+
+> 终审人：褚岩（PM）。**独立黑盒**：不采信上游（TASK-053/054/055）自测，全部由本卡从干净上下文独立 build + docker run 隔离容器 + 自写测试资产复现。RISK-015 铁律：全程隔离容器（独立名 + 端口 + 独立网络），线上 agp-app(1.4.0/8099)/pg-unified/gw-nginx 零改动。
+
+## 1. 独立构建（黑盒起点）
+- 干净上下文：`git archive feat/mcp-http @ 3ccf9ef`（仅 `src/` 子树，= 02-development/src build context）→ `05-temp/t056/build_ctx/`。
+- 独立 build：`docker build -t agp-platform:1.6.0`（不复用 t053/t054/t055 任何镜像）。
+- **零密钥入镜像核实**：`docker run` 探针确认镜像内 `/app/.env` 不存在（`.dockerignore` 排除 `.env` + 构建上下文无 `.env`）。
+- **named volume 修复核实**：镜像内 `/app/data` 属主 = hermes(uid 1000)（T-AGP-NAMEDVOL 的 Dockerfile `mkdir -p /app/data && chown -R 1000:1000`），named volume 首挂复制后容器 uid 1000 可写。
+
+## 2. 隔离环境（RISK-015）
+- 网络 `t056-net`；独立 PG `t056-pgdb:8452`（fresh schema `agp_t056` + legacy schema `agp_t056_legacy`，各专属角色）；3 个自写 MCP server 容器（`t056-mcp:9450` JSON / `t056-mcp-auth:9451` 401 / `t056-mcp-sse:9452` sse-always）；4 个 app 容器（`t056-sqlite:8450` fresh / `t056-sqlite-legacy:8451` legacy / `t056-pg:8453` fresh / `t056-pg-legacy:8454` legacy）。
+- legacy 库：pre-iteration-4 的 mcp_servers（仅 6 列，无 transport/url/headers）+ 存量 stdio 行，用于在线迁移幂等 + 零回归验证。
+- 测试 HTTP server：褚岩独立自写 stdlib 最小 Streamable HTTP server（`05-temp/t056/mcp_server_t056.py`，工具名带 `t056_` 前缀避免与上游混淆），不复用 t053/t054/t055 任何文件。
+- 证据目录：`05-temp/t056/`（api_test.py/.log、ui_test.py/.log、api_results.json、ui_results.json、mcp_server_t056.py、legacy_*、t056*.env、build_ctx/）。
+
+## 3. 验收标准逐条终审（本卡独立执行）
+
+### 3.1 范围1 stdio 零回归（4 base 全过）
+S1 seed demo `transport=stdio url=''` / S2 demo tools/list（get_time+get_patient_demo）/ S3 demo tools/call get_time / S4 新建 stdio server tools/list+call —— **全 PASS**（29~33 用例每 base）。
+
+### 3.2 范围2 HTTP 传输（真实 server，4 base 全过）
+- H1 注册 http server（transport=http + url + headers）→ H1b 回显三字段（cmd=''，DECISION-024.3）。
+- H2 tools/list **真实工具**（t056_time/t056_add/t056_echo/t056_sse）。
+- H3 tools/call `add(4,7)=11` / H3b `echo` 真实计算。
+- H4 mcp_call 引擎分流（agent 绑定 http mcp + mcp_call 插件）→ tools/call 真实调用成功。
+- **E1 URL 不可达** → `502`（非裸 500），报错**含 URL**（`MCP HTTP 端点不可达 http://127.0.0.1:9999/mcp: ConnectError`），0.0s 不 hang。
+- **E2 401 无 header** → `502`，报错含 `401` + URL + 错误体（可读）。
+- **E3 401 带正确 Authorization header** → `200` 真实工具（鉴权 header 生效）。
+- **SSE 流**：S1 SSE server tools/list / S2 `t056_sse` tools/call 经 SSE 流消费（notification 帧跳过 + 结果帧解析，`via=sse`）。
+
+### 3.3 范围3 双 schema 迁移幂等 + 存量行默认 stdio（DB 层核实）
+- **D1 fresh sqlite**：9 列（含 3 新列），demo 行 `transport=stdio url='' headers='{}'`。
+- **D2 legacy sqlite**：原 6 列 → 在线 ALTER 补齐至 **9 列**（`id,name,command,args,env,enabled,transport,url,headers`），存量行全落 `stdio/''/'{}'`（零回归）。
+- **D3 legacy PG**：原 6 列 → `ADD COLUMN IF NOT EXISTS` 补齐至 **9 列**，列默认 `transport='stdio'::text`/`url=''::text`/`headers='{}'::jsonb`。
+- **D4 legacy PG 行**：存量行 `transport=stdio` 默认（3 行全 stdio）。
+
+### 3.4 范围4 前端 Playwright 抽验（真实 Chromium，褚岩自写）
+U1 表单默认 stdio 态（cmd 显 / URL 隐 / stdio-wrap 显 / http-wrap 隐）· U2 切 http（URL+headers 显 / cmd 隐）· U3 切回 stdio · U4 列表 stdio/http 传输标记（badge）· U5 新建 http server 保存 → API 回显 transport/url/headers + 列表 http 标记 · U6 编辑 http server 回显 transport=http/url/headers · U7 stdio 行显示 command —— **8/8 PASS**（`ui_test.py` / `ui_results.json`）。
+
+### 3.5 范围5 校验矩阵（4 base 全过）
+V1 非法 transport `ftp` → 400 · V2 http 无 url → 400 · V3 http 非法 url → 400 · V4 stdio command 空白 → 400 · V5 name 空 → 400 · V6 `transport=HTTP` 大写 → 200 归一 http · V7 http command 空串 → 200 回显 '' · V8a 重名 → 409 · V8b 不存在 → 404。
+
+## 4. 测试矩阵汇总
+| 范围 | 结果 |
+|---|---|
+| API（4 base：fresh/legacy × sqlite/PG）| **124/124 PASS**（fresh-sqlite 29 / legacy-sqlite 33 / fresh-PG 29 / legacy-PG 33）|
+| 前端 Playwright | **8/8 PASS** |
+| 双 schema 迁移（DB 层）| **D1-D4 全 PASS**（legacy 6→9 列在线补齐，存量行默认 stdio）|
+| stdio 零回归 / HTTP 真实 server / 错误处理 / SSE / 校验矩阵 | 全 PASS |
+
+**判定：P0=0 / P1=0 / P2=0（无阻塞缺陷），任务书 §测试要求 6 条全过 + §交付验收标准满足。**
+
+## 5. 交付动作（全绿后执行）
+- merge `feat/mcp-http` → `main`（ff：feat 基于 edb323e=origin/main，main=45ddd4a 为 origin 祖先 → ff 到 3ccf9ef + 本版文档 commit）。
+- `git push origin main` + `git push origin tag 1.6.0`（凭 `~/.git-credentials` 新 PAT，2026-09-18 已验证含 workflow scope）。
+- **不检查 CI、不验证 GCP**（DECISION-024.2，用户 2026-09-18 拍板口径）。
+- 文档：README §3.9 MCP 双传输章节（已含 1.6.0）+ compose `image: agp-platform:1.6.0` + README §3.8 镜像行 1.6.0 + DEV_REPORT 本章。
+
+## 6. 铁律 / 约束终检
+| 约束 | 终检结果 |
+|---|---|
+| RISK-015 隔离容器 | ✅ 全程独立名+端口+t056-net；`baseline_docker_ps.txt` vs `after_docker_ps.txt` 逐条一致，线上 agp-app(1.4.0/8099)/pg-unified/gw-nginx 零改动，8099/8081 恒 200 |
+| 零硬编码密钥 | ✅ `git diff main..feat/mcp-http` 新增行扫 `sk-`/`ghp_`/`API_KEY=<real>`/明文密码 → 零命中；测试密钥仅运行时 bind-mount 注入（t056*.env，600，不进 git） |
+| .env 不进镜像 | ✅ 镜像探针确认 `/app/.env` 不存在；`.dockerignore` 排除 `.env` + 构建上下文无 `.env` |
+| 临时文件全 05-temp/ | ✅ 全部落 `05-temp/t056/`，零 /tmp |
+| 线上未动 | ✅ 见 RISK-015 行 |
+
+## 7. 剩余风险清单（交用户）
+1. **GCP 34.121.9.233:8099 未验证**（按 DECISION-024.2 本卡不查 CI、不验 GCP）：1.6.0 已 push origin/main + tag，真实 GitHub 上 CI 自动触发部署；若 GCP 侧未恢复需用户侧读 CI 日志 / 登录 GCP 诊断（本机凭据无 admin 读 CI 日志权限，RISK-027）。
+2. **RISK-023 遗留**：建议轮换 `AI_MODEL_API_KEY` + `JWT_SECRET`（.env.bak 历史镜像泄漏 + 短 JWT），destructive 操作交用户。
+3. **LLM 工具调用 flakiness（P2 非阻塞，模型层）**：对话链路偶发不触发 mcp_call（vllm-qwen3.8-27b 层，非应用缺陷）——引擎 HTTP 分流由 H4 + 确定性 tools/call 已证明，不影响 1.6.0 交付。
+4. **SSE 流边界（P3 观察）**：若 server 只发 notification 帧不发结果帧，客户端报"未返回结果帧"（协议边界，真实 server 均发结果帧，本卡 S2 已验证正常消费）。
