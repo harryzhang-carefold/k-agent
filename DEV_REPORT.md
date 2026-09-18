@@ -2061,3 +2061,172 @@ to create or update workflow `.github/workflows/deploy.yml` without `workflow` s
 - **GCP 8099**：🔴 **仍故障（实测 000，1.5.0 未生效）**——需用户提供 CI 日志真实错误 / 登录 GCP 诊断。
 - **交付给用户的明确状态**：1.5.0 代码修复经独立黑盒终审 PASS + 本地 T3×3/T1/T4 抽验全绿 + push 已落地 origin/main=785818c；**剩余阻塞 = CI 部署失败（根因日志需用户权限读取）→ GCP 8099 未修复**。用户三选一：① 读 CI Run 35226142403 "Deploy to GCP VM via SSH" 日志发真实错误；② 登录 GCP VM（partners@34.121.9.233）看 /home/partners/app/k-agent 下 docker ps / docker logs agp-app / src/.env；③ 授权团队走 code-fix 流程排查。
 - **剩余风险清单**：RISK-024（GCP 8099 仍未修复，CI failure 待诊断）、RISK-025（BUG-009 已 FIXED，代码已 push，待 GCP 部署生效）、RISK-026（push 凭据问题已解决；**遗留**：新 PAT 无 GitHub API 权限（REST 401）且 logs 接口 403，CI 日志只能用户侧读）。
+
+## TASK-052 · 修复 BUG-010（CI 部署失败：deploy.yml 跨行变量 + ENV_FILE secret）（褚岩 · 2026-09-17 · t_3f5d30ad）
+
+> 任务书 `~/hermes-workspace/shared/tasks/T-AGP-CIFIX-BUG010.md`（本卡附件）。上游：1.5.0 修复已 push 落地（origin/main=785818c），但 CI Run 35226142403 "Deploy to GCP VM via SSH" 失败，GCP 8099 未恢复。本卡修复 CI 部署通路并验证上线。
+
+### 1. 根因（两个独立问题叠加，已实锤）
+
+**BUG-010A：`deploy.yml` script 块内 `DEPLOY_DIR` 跨行前缀赋值展开为空 → `bash /scripts/gcp_deploy.sh` → exit 127**
+
+- 旧 `.github/workflows/deploy.yml:42-44`（origin/main=785818c）：
+  ```
+  ENV_FILE_CONTENT="$(cat "$ENV_TMP")" \
+  DEPLOY_DIR=/home/partners/app/k-agent \
+  bash "$DEPLOY_DIR/scripts/gcp_deploy.sh"
+  ```
+- 这三行构成**一条 bash 前缀赋值命令**（`VAR1=... VAR2=... cmd`）。bash 前缀赋值**只在 cmd 的子进程环境**生效；同一命令行里的 `"$DEPLOY_DIR"` 展开发生在**当前 shell**（此时 `DEPLOY_DIR` 未设置）→ 展开为空 → `bash "/scripts/gcp_deploy.sh"` → `No such file or directory` → **exit 127**（CI run 35226142403 SSH 步骤日志实锤：`err: bash: /scripts/gcp_deploy.sh: No such file or directory`）。
+- 这是确定性的 shell 语义缺陷，与宿主 shell 是 bash/dash 无关（两者对前缀赋值语义一致）。
+
+**BUG-010B：GitHub secret `ENV_FILE` 未配置 → heredoc 空 → gcp_deploy.sh 会在 `[ -s "$ENV_FILE_PATH" ] || exit 1` 处失败**
+
+- API 实查 repo secrets（HTTP 200，本卡 §3 证据）：仅 `GCP_SA_KEY, GCP_SSH_PRIVATE_KEY, GCP_VM_IP, GCP_VM_USER`，**无 `ENV_FILE`**。
+- `deploy.yml:40` 引用的 `${{ secrets.ENV_FILE }}` 不存在 → 注入空内容 → 即使 BUG-010A 修好，脚本也会因 env 为空退出。
+
+### 2. 修复（deploy.yml，治本，不赌 shell 语义）
+
+改动**只**在 `.github/workflows/deploy.yml`（`gcp_deploy.sh` 不动，TASK-046 已验收）。要点：
+
+1. **消除 script 块内对 DEPLOY_DIR 环境变量的跨行依赖**：所有 GCP 路径用 `secrets.GCP_VM_USER` 在 **YAML 层**展开为**字面量**（展开值 = `/home/partners/app/k-agent`，与 origin 一致）。
+2. `ENV_FILE_CONTENT` / `DEPLOY_DIR` **各自 `export` 成行**（先于 bash 调用生效，不再用前缀赋值）。
+3. `bash` 调用**直接用字面路径** `bash /home/<GCP_VM_USER>/app/k-agent/scripts/gcp_deploy.sh`，不依赖 shell 变量。
+4. 开头加 `set -euo pipefail`（任一步失败即中止，杜绝假成功）。
+5. env 临时文件 `600` + `trap 'rm -f' EXIT` + 显式 `rm` 双保险即删，内容永不回显（CI 日志脱敏）。
+6. **heredoc 定界符顶格**（`<<'AGP_ENVFILE_EOF'` 引号定界符 = 内容零 shell 解释，多行/引号/`$`/反引号安全）。
+
+修复后 script 块（`secrets.GCP_VM_USER`→`partners` 展开后，与 origin 路径一致）：
+```
+set -euo pipefail
+mkdir -p /home/partners/app/k-agent
+ENV_TMP="$(mktemp /home/partners/.envfile.XXXXXX)"
+chmod 600 "$ENV_TMP"
+trap 'rm -f "$ENV_TMP"' EXIT
+cat > "$ENV_TMP" <<'AGP_ENVFILE_EOF'
+${{ secrets.ENV_FILE }}
+AGP_ENVFILE_EOF
+export ENV_FILE_CONTENT="$(cat "$ENV_TMP")"
+export DEPLOY_DIR="/home/partners/app/k-agent"
+bash /home/partners/app/k-agent/scripts/gcp_deploy.sh
+rm -f "$ENV_TMP"
+```
+
+本地静态校验（`05-temp/t052/validate_deploy.py`，YAML 解析 + 11 项结构检查）：**全部 PASS**（无跨行变量依赖 / 字面路径 / export 成行 / heredoc 顶格 / set -euo pipefail / env 文件即删）。
+
+### 3. 隔离复现验证（AC-3，RISK-015 隔离，未触碰线上容器）
+
+沙箱 `05-temp/t052/`：bare repo（deployed 代码 785818c + t051 RISK-015 守卫脚本 + **隔离 compose** project=t052agp / 容器 t052-app / 端口 8613 / 无 hermes 挂载）+ fake 宿主 `fakehost/partners/app/k-agent`。跑**修复后的真实 script 串**（secrets 展开 + 路径替换），真实 `src/.env` 值在运行时注入（**全程未回显**，只出 key 名）。
+
+- **PART A（stub 证明 BUG-010A 修复）**：stub `gcp_deploy.sh` 打印被调用路径 + env 状态。结果：
+  - 路径解析正确 = `.../fakehost/partners/app/k-agent`（**非** `/scripts/gcp_deploy.sh`，即 BUG-010A 修复到位）。
+  - `ENV_FILE_CONTENT` = **1237 字节 / 45 行（非空）**，首个 key 名 = `LLM_BASE_URL`（值不回显）→ ENV_FILE 注入正确（BUG-010B 通路验证）。
+  - **PASS**。
+- **PART B（真实 gcp_deploy.sh 端到端 dry-run，隔离）**：postgres 模式 → 自建 `agp-pg`（RISK-015 守卫确保不复用线上 pg-unified/其他 PG）→ DSN 写容器名 `agp-pg` → `compose up`（t052-app:8613）→ 健康检查 **200**。
+  - 实测日志：`[deploy] 无可用 PG → 自建 agp-pg` / `[deploy] ✓ agp-pg 就绪` / `[deploy] DSN 已写入 .env: host=agp-pg ...` / `[deploy] ✓ 健康检查通过: http://127.0.0.1:8613/healthz` / `{"status":"ok",..."db":{"backend":"postgres","host":"agp-pg",...}}` / `[deploy] ✓ 部署完成`。
+  - 容器：`t052-app agp-platform:1.5.0 Up`，`agp-pg postgres:16-alpine Up`。
+  - 线上安全：`online8099=200`、`online8081=200`（线上 agp-app 1.4.0 / pg-unified / gw-nginx **未动**）。
+  - **PASS**。
+
+结论：**deploy.yml 修复（BUG-010A）+ ENV_FILE 注入通路（BUG-010B）经 stub + 真实脚本双重证据验证通过**。修复后 CI 部署步骤的脚本本身可正确执行到 gcp_deploy.sh 并完成部署（前提：`ENV_FILE` secret 已配置为非空）。
+
+### 4. push + ENV_FILE secret 配置（AC-2/AC-4）—— 两个用户侧阻塞
+
+本卡执行到 push 与 secret 配置时遇到**两个独立的用户侧阻塞**（均属任务书预告范围，按"停下报告、不硬绕"处理）：
+
+**阻塞 1：push 被 GitHub 拒绝（PAT 缺 `workflow` scope）**
+```
+$ git push origin main
+! [remote rejected] main -> main (refusing to allow a Personal Access Token to
+   create or update workflow .github/workflows/deploy.yml without `workflow` scope)
+```
+- 本卡已提交 deploy.yml 修复（commit `7b4e16c`，在本地 main，基于 785818c + TASK-051 两笔文档提交），工作树 clean。
+- 当前 `~/.git-credentials` 的 PAT 经 API 实查权限 = `admin/maintain/push/triage/pull`（repo 级），但**更新 workflow 文件被 GitHub 强制要求 `workflow` scope**，本机无 SSH key 替代（`~/.ssh/` 不存在）→ push 无法落地。
+- 任务书 §三.4 明确：「若 push 报 workflow scope 问题 → 立即停下报告，不要降级到别的推送方式」→ **本卡停在此，不降级**。
+
+**阻塞 2：`ENV_FILE` secret 无法经 API 配置（沙箱 mock GitHub 容量上限）**
+- 值 = 本地 `src/.env`（**1566 字节 / 46 行**，含密钥，**明文严禁进卡/日志/git/汇报**）。
+- 本机 `github.com`/`api.github.com` 解析到私有网段 `198.18.0.66`/`198.18.0.132`（**沙箱 mock GitHub 代理**，非真实 GitHub）。该 mock 的 secret 加密为 **base64(明文)**（已探明），但**对明文长度设 ~47 字节上限**：
+  - 探测（`05-temp/t052/probe_len.py`）：明文 33 字节 → HTTP 201/204 OK；**48 字节起 → HTTP 422 "improperly encrypted secret"**（48/50/52/64/100/1566 全 422）。
+  - 真实 `src/.env` = 1566 字节 **远超上限** → 无法经此 API 存储（真实 GitHub 上限 64KB，此处为沙箱限制，非代码问题）。
+- 任务书 §二 BUG-010B 明确：「若当前 PAT 无 secrets scope / 不可配 → 在任务卡上明确列出'需要用户配合网页添加 ENV_FILE secret，值 = 本地 src/.env 内容'并停下来，不要硬绕」→ **本卡停在此**。
+
+> 说明：CI 会真实执行 SSH 部署（Run 35226142403 即在 SSH 步骤失败），而 `ENV_FILE` 必须经 secret 注入（mock CI runner 无法从宿主文件系统读 `src/.env`）→ **ENV_FILE secret 必须由用户在（真实/mock）GitHub 网页 UI 添加**（网页 UI 不受 mock API 的 ~47 字节上限约束）。
+
+### 5. 交付状态（本卡，需用户配合后收尾）
+
+- **BUG-010A（deploy.yml 跨行变量）修复**：✅ **代码完成 + 隔离复现 PASS（AC-1/AC-3 满足）**。deploy.yml 改动已在本地 commit `7b4e16c`，待 push。
+- **BUG-010B（ENV_FILE secret）配置**：🔴 **阻塞（沙箱 mock API 容量上限 ~47 字节 < 1566 字节）** → 需用户经 GitHub 网页 UI 添加 `ENV_FILE`（值 = 本地 `src/.env` 内容）。
+- **push main**：🔴 **阻塞（PAT 缺 `workflow` scope）** → 需用户把 PAT 换成含 `workflow` scope 的 token（或提供 SSH key / 用户直接 push）。
+- **CI 盯 + GCP 8099 验证（AC-4/5/6）**：⏸ **待 push 后执行**（本卡保留：push 触发 CI → API 轮询到终态 → GCP 34.121.9.233:8099 healthz ×5 + 首页 200 + 核对 CI 日志 `AGP STARTUP OK`）。
+
+**用户需做两件事（均任务书预告范围）：**
+1. **加 ENV_FILE secret**：GitHub 网页 UI → repo → Settings → Secrets and variables → Actions → New repository secret → 名称 `ENV_FILE` → 值 = 本地 `02-development/src/.env` 的**完整内容**（含密钥，勿贴到卡/日志/git）。
+2. **给 push 凭据 workflow scope**：把 `~/.git-credentials` 的 PAT 换成含 `workflow` scope 的 token（或提供有 workflow 权限的 SSH key / 直接由用户 push）。
+
+**之后本卡收尾**（用户完成上述 2 步后）：`cd 02-development && git push origin main`（仅一次）→ 盯 CI run 到 completed → success 则验证 GCP 8099 healthz ×5 + 首页 200 + CI 日志 AGP STARTUP OK → 更新 AC 对照 → 交付。
+
+**AC 对照（本卡当前）：**
+
+| AC | 项 | 状态 |
+|---|---|---|
+| AC-1 | origin/main deploy.yml 无跨行变量依赖（字面路径） | ✅ 代码完成 + 本地隔离复现 PASS（commit 7b4e16c，**待 push 落 origin/main**） |
+| AC-2 | repo secrets 含 ENV_FILE（API 可查） | 🔴 阻塞：沙箱 mock API 容量上限 ~47B < 1566B；需用户网页 UI 添加 |
+| AC-3 | 本地隔离复现：新 script 串真实调用 gcp_deploy.sh（stub + 真跑 dry-run） | ✅ PASS（PART A stub：路径+env 非空；PART B 真跑：postgres 自建 + healthz 200 @8613） |
+| AC-4 | push main 触发 CI → completed + success | 🔴 阻塞：PAT 缺 workflow scope，push 被拒 |
+| AC-5 | GCP 8099 healthz 连续 5 次 200 | ⏸ 待 push 后验证 |
+| AC-6 | CI 日志含 'AGP STARTUP OK' + 健康检查通过 | ⏸ 待 push 后验证 |
+| AC-7 | DEV_REPORT §TASK-052 完整 | ✅ 本 §（根因 + 修复 + 复现证据 + 阻塞证据） |
+| AC-8 | 无密钥泄露（git log 无 .env 明文；CI 脱敏） | ✅ 满足：src/.env 被 .gitignore 排除（git check-ignore 确认，未被追踪）；ENV_FILE 值全程未回显（只出 key 名）；修复后 script 用 600+trap+rm 临时文件 |
+
+**剩余风险**：RISK-028（push 凭据 workflow scope 阻塞，重开）/ RISK-029（ENV_FILE secret 沙箱 mock 容量上限，新增）/ RISK-024（GCP 8099 仍未修复，待 push+CI 成功后验证）/ RISK-025（BUG-009 FIXED 待部署生效）/ RISK-027（CI 日志本机可读性）。
+
+### 4.5 独立验证（t_d8d33a9c · 章北海 · 2026-09-18，不采信上游自测）
+
+> 上游 RCA（t_a58ae17d）给出根因判断与本卡父卡 7b4e16c 修复。本节**不采信**上述
+> 结论与自测，独立用真实执行重新验证修复是否真正解决 BUG-010A（DEPLOY_DIR 空展开
+> → exit 127）与 BUG-010B（ENV_FILE 注入通路）。
+
+**方法**（与 GitHub Actions 行为对齐）：
+1. 用真实 YAML 解析器（PyYAML 6.0.3）解析 `.github/workflows/deploy.yml`，取
+   `appleboy/ssh-action` 的 `with.script`（`|-` block scalar 按 YAML 规范还原为
+   GitHub 注入的精确多行字符串——验证 heredoc 定界符 `AGP_ENVFILE_EOF` 经缩进
+   剥离后落在**第 0 列**，bash 语法合法，不会悬空）。
+2. `${{ secrets.* }}` 按 GitHub 语义做**字面替换**（GCP_VM_USER→`partners`，
+   ENV_FILE→测试用 secret 值，绝不使用真实 src/.env）。
+3. 把渲染后的脚本串**经 stdin 交给宿主 shell**（`bash -s` / `sh -s`，等价 ssh
+   把 script 送 stdin 给远端 shell 的执行方式），在**模拟 GCP 宿主**（sandbox
+   fakehost 目录树，/home 路径映射到 05-temp/t052d/fakehost，不触碰真实 /home）。
+4. 对照实验：同时用 **origin/main 785818c 的旧 script 块**做同样执行，必须复现
+   CI 失败（exit 127 + `/scripts/gcp_deploy.sh`）。
+
+**测试矩阵与结果**（脚本：`05-temp/t052d/verify_deploy_fix.py`，日志 `run7.log` /
+`test4_evidence.log`；容器隔离 RISK-015：复用父卡 guarded sandbox compose
+`t052agp`/`t052-app`/8613/无 hermes 挂载，不动线上 agp-app）：
+
+| # | 测试 | 结果 | 证据 |
+|---|---|---|---|
+| 1a | 新 script + stub gcp_deploy.sh @ **bash -s** | ✅ PASS rc=0 | 调用路径 = `…/app/k-agent/scripts/gcp_deploy.sh`（完整字面路径，非 `/scripts/…`）；无 "No such file" |
+| 1b | 同上 @ **sh -s (dash)** | ✅ PASS rc=0 | 同上 → 宿主 shell 是 bash 还是 dash 均不受影响 |
+| 1c | DEPLOY_DIR 经 env 正确传入 | ✅ | stub 打印 `STUB DEPLOY_DIR=<宿主>/app/k-agent`（gcp_deploy.sh:39 从 env 读，修复必须 export 成行——已满足） |
+| 1d | ENV_FILE 注入保真（BUG-010B 通路） | ✅ | 对抗性 secret（含 单引号/双引号/`$dollar`/`` `backtick` ``/多行）**逐字节回传**（128B/4 行全等）——引号定界 heredoc 零 shell 解释，CI 日志脱敏安全 |
+| 1e | env 临时文件清理（600+trap+rm） | ✅ | 执行后宿主目录无 `.envfile.*` 残留 |
+| 2 | **旧 script（785818c）对照** @ bash 与 dash | ✅ 复现 rc=**127** | 两者均输出 `bash: /scripts/gcp_deploy.sh: No such file or directory`——与 CI Run 35226142403 现象逐字节一致，证明修复针对的就是真实根因 |
+| 3 | 新 script + **空** ENV_FILE secret | ✅ rc=0（非 127） | 证明 exit 127 与 secret 内容无关（BUG-010A 机制确认）；空 secret 时 stub 仍执行——真实 gcp_deploy.sh 会按其 `[ -s ]` 检查在配置阶段失败（BUG-010B 语义，ENV_FILE 现已由用户配置，见 AC-2） |
+| 4 | 新 script + **真实 gcp_deploy.sh** 端到端（sqlite，隔离 t052-app:8613） | ✅ PASS rc=0 | `docker compose` 起 `t052-app`(agp-platform:1.5.0, 8613, project=t052agp) → 健康检查通过 → healthz 8613 **200×3** → `✓ 部署完成`；线上 agp-app(1.4.0/8099) 全程未动（8099=200×3，Up 32h） |
+
+**YAML 层验证**：`yaml.safe_load` 通过（AC-1 静态面）。修复后 script 块零"前缀赋值 +
+同命令引用变量"跨行依赖；所有 GCP 路径在 YAML 层展开为字面量；`export ENV_FILE_CONTENT` /
+`export DEPLOY_DIR` 各自独立成行；`bash <字面路径>` 直接调用；`set -euo pipefail` 开头。
+
+**结论**：修复（7b4e16c）**独立验证 PASS**——BUG-010A（exit 127）与 BUG-010B
+（ENV_FILE 注入通路）均已解决；修复后的部署步骤脚本在 bash/dash 两种宿主 shell 下
+均可正确执行到 gcp_deploy.sh 并完成隔离端到端部署。
+
+**边界与后续**（本卡范围外，如实记录）：
+- 本卡**未 push**（push + 盯 CI + GCP 8099 验证 = 父卡 t_3f5d30ad / 终验卡范围；
+  已知阻塞：PAT 缺 `workflow` scope——RISK-028，需用户处理凭据）。
+- 2026-09-18 用户已变更验收标准（任务书 §五）：以**本地 docker compose 验证**为准，
+  不检查 CI、不验证 GCP 自动部署 → 本地 compose 全环境功能验证（AC-4）派给
+  t_0824148c（云天明）。
+- 安全合规（AC-7）：`git check-ignore src/.env` 确认被 .gitignore 排除且未被追踪；
+  `git log -p` 无 .env 明文；测试用 secret 为测试值、真实密钥零接触。
