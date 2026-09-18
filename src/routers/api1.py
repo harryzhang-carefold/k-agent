@@ -437,15 +437,49 @@ async def upload_skills(request: Request,
 # ---- MCP ----
 class MCPServerIn(BaseModel):
     name: str
-    command: str
+    command: str = ""
     args: list[str] = []
     env: dict = {}
+    transport: str = "stdio"   # TASK-053 迭代4: 'stdio' | 'http'
+    url: str = ""              # TASK-053 迭代4: http 传输端点
+    headers: dict = {}         # TASK-053 迭代4: 可选自定义请求头（如 Authorization）
     enabled: bool = True
 
 
 def _norm_env(env) -> dict:
     """env 值统一为 str（MCP 子进程 env 只能是字符串；数字/布尔 400 由调用方控制）。"""
     return {str(k): str(v) for k, v in (env or {}).items()}
+
+
+def _norm_headers(headers) -> dict:
+    """headers 值统一为 str（HTTP 请求头只能是字符串）。"""
+    return {str(k): str(v) for k, v in (headers or {}).items()}
+
+
+def _validate_mcp_in(body: "MCPServerIn") -> None:
+    """TASK-053 迭代4 校验矩阵（DECISION-024.3）：
+
+    - transport 必须是 'stdio' | 'http'（大小写不敏感；其他值 400）
+    - transport=http  => url 非空且是合法 http(s) URL（否则 400）
+    - transport=stdio => command 非空（否则 400）
+    http 行 command 允许空串（PM 裁定：command 保持 stdio 专属语义，url 存端点）。
+    """
+    t = (body.transport or "stdio").strip().lower()
+    if t not in ("stdio", "http"):
+        raise APIError(400, f"非法 transport: {body.transport!r}（仅支持 'stdio' | 'http'）")
+    if t == "http":
+        u = (body.url or "").strip()
+        if not u:
+            raise APIError(400, "transport=http 时 url 必填（http(s) 端点地址）")
+        from urllib.parse import urlparse
+        p = urlparse(u)
+        if p.scheme not in ("http", "https") or not p.netloc:
+            raise APIError(400, f"非法 MCP http url（需 http/https + host）: {u}")
+    else:
+        if not (body.command or "").strip():
+            raise APIError(400, "transport=stdio 时 command 必填（外部 MCP 可执行程序）")
+    if not (body.name or "").strip():
+        raise APIError(400, "name 不能为空")
 
 
 @ext.get("/mcp")
@@ -455,36 +489,64 @@ async def list_mcp(request: Request, user: dict = Depends(require_perm("ext:mana
 
 
 def _mcp_row_out(row: dict) -> dict:
-    """mcp_servers 行 -> API 视图：args/env 反序列化为 JSON，enabled 归一为 bool。"""
+    """mcp_servers 行 -> API 视图：args/env/headers 反序列化为 JSON，enabled 归一为
+    bool，transport/url 缺省补齐（存量行零回归：stdio + 空 url）。"""
     r = dict(row)
     try:
         r["args"] = json.loads(r.get("args") or "[]")
     except (json.JSONDecodeError, TypeError):
         r["args"] = []
     r["env"] = _mcp_env_of(row)
+    r["headers"] = mcp_client.headers_of_row(row)
+    r["transport"] = mcp_client.transport_of_row(row)
+    r["url"] = (r.get("url") or "")
     r["enabled"] = bool(r.get("enabled"))
     return r
+
+
+async def _mcp_run_tools(row: dict, fn):
+    """按行 transport 分流执行 MCP 会话（TASK-053 迭代4）：
+    stdio -> with_session（command/args/env）；http -> with_http_session（url/headers）。
+    异常由调用方统一转 502（MCPError 含 URL/status 信息，可读透传）。"""
+    t = mcp_client.transport_of_row(row)
+    if t == "http":
+        url = (row.get("url") or "").strip()
+        if not url:
+            raise APIError(502, "MCP http server 缺少 url（行数据异常，请用 PUT 补全）")
+        return await mcp_client.with_http_session(url, mcp_client.headers_of_row(row), fn=fn)
+    return await mcp_client.with_session(row["command"], json.loads(row.get("args") or "[]"),
+                                         env=_mcp_env_of(row), fn=fn)
 
 
 @ext.post("/mcp")
 async def create_mcp(body: MCPServerIn, request: Request,
                      user: dict = Depends(require_perm("ext:manage"))):
+    _validate_mcp_in(body)
+    t = body.transport.strip().lower()
     conn = request.app.state.db
     if await db.fetchone(conn, "SELECT id FROM mcp_servers WHERE name=?", (body.name,)):
         raise APIError(409, f"mcp server 重名: {body.name}")
-    # TASK-022 / F1: env 写入（此前丢失）；统一双后端为 JSON 文本，读取时反序列化
+    # TASK-022 / F1: env 写入（此前丢失）；统一双后端为 JSON 文本，读取时反序列化。
+    # TASK-053 迭代4: transport/url/headers 同路径写入（headers 双后端 JSON 文本）。
     mid = await db.execute(
         conn,
-        "INSERT INTO mcp_servers (name, command, args, env, enabled) VALUES (?,?,?,?,?)",
-        (body.name, body.command, json.dumps(body.args),
-         json.dumps(_norm_env(body.env), ensure_ascii=False), body.enabled))
+        "INSERT INTO mcp_servers (name, command, args, env, transport, url, headers, enabled) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (body.name, body.command or "", json.dumps(body.args),
+         json.dumps(_norm_env(body.env), ensure_ascii=False),
+         t, (body.url or "").strip() if t == "http" else "",
+         json.dumps(_norm_headers(body.headers), ensure_ascii=False) if t == "http" else "{}",
+         body.enabled))
     return {"id": mid, "name": body.name}
 
 
 @ext.put("/mcp/{mid}")
 async def update_mcp(mid: int, body: MCPServerIn, request: Request,
                      user: dict = Depends(require_perm("ext:manage"))):
-    """TASK-022 / F1: MCP server 更新（name/command/args/env/enabled）。"""
+    """TASK-022 / F1: MCP server 更新（name/command/args/env/enabled）；
+    TASK-053 迭代4 增 transport/url/headers 三字段 + 校验矩阵。"""
+    _validate_mcp_in(body)
+    t = body.transport.strip().lower()
     conn = request.app.state.db
     if not await db.fetchone(conn, "SELECT id FROM mcp_servers WHERE id=?", (mid,)):
         raise APIError(404, "mcp server 不存在")
@@ -494,9 +556,13 @@ async def update_mcp(mid: int, body: MCPServerIn, request: Request,
         raise APIError(409, f"mcp server 重名: {body.name}")
     await db.execute(
         conn,
-        "UPDATE mcp_servers SET name=?, command=?, args=?, env=?, enabled=? WHERE id=?",
-        (body.name, body.command, json.dumps(body.args),
-         json.dumps(_norm_env(body.env), ensure_ascii=False), body.enabled, mid))
+        "UPDATE mcp_servers SET name=?, command=?, args=?, env=?, transport=?, url=?, "
+        "headers=?, enabled=? WHERE id=?",
+        (body.name, body.command or "", json.dumps(body.args),
+         json.dumps(_norm_env(body.env), ensure_ascii=False),
+         t, (body.url or "").strip() if t == "http" else "",
+         json.dumps(_norm_headers(body.headers), ensure_ascii=False) if t == "http" else "{}",
+         body.enabled, mid))
     return {"id": mid, "updated": True}
 
 
@@ -528,9 +594,7 @@ async def mcp_tools(mid: int, request: Request, user: dict = Depends(require_per
     try:
         async def _fn(s):
             return await s.tools_list()
-        tools = await mcp_client.with_session(row["command"], json.loads(row["args"] or "[]"),
-                                              env=_mcp_env_of(row),
-                                              fn=_fn)
+        tools = await _mcp_run_tools(row, _fn)
         return {"server": row["name"], "tools": tools}
     except Exception as e:
         raise APIError(502, f"MCP 连接失败: {e}")
@@ -550,9 +614,7 @@ async def mcp_tool_call(mid: int, tool: str, body: ToolCallIn, request: Request,
     try:
         async def _fn(s):
             return await s.tools_call(tool, body.arguments)
-        result = await mcp_client.with_session(row["command"], json.loads(row["args"] or "[]"),
-                                               env=_mcp_env_of(row),
-                                               fn=_fn)
+        result = await _mcp_run_tools(row, _fn)
         return {"ok": True, "tool": tool, "result": result}
     except Exception as e:
         raise APIError(502, f"MCP 调用失败: {e}")

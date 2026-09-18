@@ -45,6 +45,10 @@ CREATE TABLE IF NOT EXISTS mcp_servers (
   name TEXT UNIQUE NOT NULL,
   command TEXT NOT NULL,
   args TEXT DEFAULT '[]',           -- JSON list
+  env TEXT DEFAULT '{}',            -- JSON dict（TASK-022 / F1）
+  transport TEXT DEFAULT 'stdio',   -- TASK-053 迭代4: 'stdio' | 'http'（Streamable HTTP）
+  url TEXT DEFAULT '',              -- TASK-053 迭代4: http 传输的端点（http/https URL）
+  headers TEXT DEFAULT '{}',        -- TASK-053 迭代4: JSON dict，可选自定义请求头
   enabled INTEGER DEFAULT 1
 );
 

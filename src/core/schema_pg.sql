@@ -113,6 +113,9 @@ CREATE TABLE IF NOT EXISTS mcp_servers (
   command TEXT NOT NULL,
   args TEXT DEFAULT '[]',                            -- JSON list（业务按字符串 json.loads）
   env JSONB DEFAULT '{}'::jsonb,                    -- TASK-022 / F1（API 层按 dict 读）
+  transport TEXT DEFAULT 'stdio',                   -- TASK-053 迭代4: 'stdio' | 'http'（Streamable HTTP）
+  url TEXT DEFAULT '',                              -- TASK-053 迭代4: http 传输端点
+  headers JSONB DEFAULT '{}'::jsonb,                -- TASK-053 迭代4: 可选自定义请求头（dict）
   enabled BOOLEAN DEFAULT true
 );
 

@@ -44,7 +44,10 @@ PLUGIN_REGISTRY = {
 
 
 async def call_plugin(name: str, arguments: dict, context: dict) -> dict:
-    """context: {"agent_id", "mcp_command", "mcp_args", "mcp_env"} for mcp_call routing."""
+    """context: mcp_call 路由字段（mcp_client.mcp_ctx_from_row 产出）：
+    {mcp_transport, mcp_command, mcp_args, mcp_env, mcp_url, mcp_headers}。
+    兼容旧引擎直接传 {mcp_command, mcp_args, mcp_env}（无 transport → 按 stdio）。
+    """
     if name not in PLUGIN_REGISTRY:
         return {"ok": False, "error": f"插件不存在: {name}"}
     arguments = arguments or {}
@@ -58,6 +61,18 @@ async def call_plugin(name: str, arguments: dict, context: dict) -> dict:
             return {"ok": True, "text": arguments.get("text", "")}
         if name == "mcp_call":
             from mcp import mcp_client
+            transport = (context.get("mcp_transport") or "stdio").strip().lower()
+            if transport not in ("stdio", "http"):
+                transport = "stdio"
+            if transport == "http":
+                url = (context.get("mcp_url") or "").strip()
+                if not url:
+                    return {"ok": False, "error": "agent 绑定的 MCP server 缺少 http url"}
+                async def _do_http(s):
+                    return await s.tools_call(arguments.get("name", ""), arguments.get("arguments"))
+                result = await mcp_client.with_http_session(url, context.get("mcp_headers"),
+                                                            fn=_do_http)
+                return {"ok": True, "mcp": arguments.get("name"), "result": result}
             command = context.get("mcp_command")
             margs = context.get("mcp_args", [])
             if not command:

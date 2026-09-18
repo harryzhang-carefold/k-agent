@@ -2230,3 +2230,98 @@ $ git push origin main
   t_0824148c（云天明）。
 - 安全合规（AC-7）：`git check-ignore src/.env` 确认被 .gitignore 排除且未被追踪；
   `git log -p` 无 .env 明文；测试用 secret 为测试值、真实密钥零接触。
+
+
+# TASK-053 · 迭代4 后端：mcp_servers 双 schema 迁移 + Streamable HTTP 客户端 + mcp_call 分流 + API 校验（2026-09-18，章北海，t_2785d382）
+
+## 1. 实现说明（对照任务书 T-AGP-MCP-HTTP.md §设计 1-3 + §5 后端）
+
+### 1.1 数据模型（双 schema：sqlite + postgres）
+`mcp_servers` 新增 3 列（`src/core/schema_sqlite.sql` + `src/core/schema_pg.sql` 同步）：
+- `transport TEXT DEFAULT 'stdio'` — `'stdio' | 'http'`
+- `url TEXT DEFAULT ''` — http 传输端点（http/https URL）
+- `headers`（sqlite: TEXT / PG: JSONB）`DEFAULT '{}'` — 可选自定义请求头（如 Authorization）
+
+**迁移（存量行自动 'stdio' 零回归）**：
+- **sqlite**：`db._sqlite_init` 现有 ALTER 迁移模式追加 3 条 `ALTER TABLE mcp_servers ADD COLUMN …`（duplicate column 幂等忽略，与 skills.updated_at/mcp_servers.env 同模式）。
+- **postgres**：`db._pg_init` 在全量 schema_pg.sql 自举之后追加 3 条 `ADD COLUMN IF NOT EXISTS`（幂等；1.5.0 及更早 agp schema 旧表在线补齐）。
+- **PM 裁定（DECISION-024.3）落地**：http 行 `command` 存**空串**（command 保持 stdio 专属语义，url 存端点）；`command NOT NULL` 约束保留；API 校验 `transport=http ⇒ url 非空且合法 http(s)`、`transport=stdio ⇒ command 非空`。
+
+### 1.2 客户端（src/mcp/mcp_client.py 扩展，**零新依赖**，用已有 httpx）
+- 新增 `MCPSessionHTTP`：MCP Streamable HTTP 协议（JSON-RPC over POST 单端点，spec 2025-03-26）
+  - `initialize` → 响应头 `Mcp-Session-Id` 捕获后同一次会话内复用（后续请求回带）
+  - `tools/list` / `tools/call` 与 stdio 版**同语义**（结果 content text 拼接后 json.loads 回退原串）
+  - 响应双态消费：`application/json` 单帧 / `text/event-stream` SSE 流（`aiter_lines` 逐帧，跳过 notification/心跳/`[DONE]`，取 id 匹配的结果帧）
+  - 通知（`notifications/initialized`）容忍 202 空体
+  - 超时：默认 10s（对齐 stdio），connect 单独 5s
+  - 错误：端点不可达 / 4xx / 5xx / 非 JSON-RPC → `MCPError`，信息含 **URL + status + body 前 200 字符**
+- 新增便捷入口 `with_http_session(url, headers, fn)`（与 `with_session` 同语义：initialize 一次，fn 内多次 tools_call，退出必关）
+- 新增行字段归一助手：`transport_of_row`（非法值按 stdio 归一）/ `headers_of_row`（双后端 JSON 文本/JSONB/NULL 归一 dict）/ `mcp_ctx_from_row`（行 → mcp_call 插件全字段上下文）
+- 未引入 mcp 官方 SDK（DECISION-024.4）：实测最小 Streamable HTTP server 全链路（JSON + SSE 双响应态）均通，无需 SDK。
+
+### 1.3 路由/插件分流（src/mcp/plugins.py + src/engine/agent_engine.py + src/routers/api1.py）
+- `plugins.call_plugin` 的 `mcp_call` 按 `context["mcp_transport"]` 分流：http → `with_http_session(url, headers)`；stdio → 现有 `with_session`（无 transport 键的旧上下文按 stdio，零回归）。
+- `agent_engine` 两处（同步 `_tool_loop` + 流式 `run_stream`）统一改为传 `_mcp_ctx(mcp_row)`（全行含 transport/url/headers）。
+- API `/api/ext/mcp`：
+  - `MCPServerIn` 增 `transport`（默认 stdio）/`url`/`headers`；`command` 改默认空串（http 行合法）
+  - `_validate_mcp_in` 校验矩阵：非法 transport 400 / http 无 url 400 / http 非法 URL（非 http(s) 或无 host）400 / stdio 无 command（含空白）400 / name 空 400
+  - POST/PUT 三字段写入（headers 双后端统一 JSON 文本；stdio 行 url/headers 归一空值）
+  - `_mcp_row_out` 回显补齐 transport/url/headers（存量行 stdio/''/{}）
+  - `GET /mcp/{id}/tools` + `POST /mcp/{id}/tools/{tool}/call` 经 `_mcp_run_tools` 按行 transport 分流（异常统一 502，MCPError 可读透传）
+
+## 2. 改动文件清单
+| 文件 | 改动 |
+|---|---|
+| `src/core/schema_sqlite.sql` | mcp_servers CREATE 增 transport/url/headers（env 一并入 CREATE，与既有 ALTER 幂等并存） |
+| `src/core/schema_pg.sql` | mcp_servers CREATE 增 transport/url(TEXT)/headers(JSONB) |
+| `src/core/db.py` | `_sqlite_init` 追加 3 条幂等 ALTER；`_pg_init` 追加 3 条 `ADD COLUMN IF NOT EXISTS` |
+| `src/mcp/mcp_client.py` | `MCPSessionHTTP` + `with_http_session` + `transport_of_row`/`headers_of_row`/`mcp_ctx_from_row` |
+| `src/mcp/plugins.py` | `mcp_call` 按 transport 分流（http/stdio） |
+| `src/routers/api1.py` | MCPServerIn 三字段 + 校验矩阵 + CRUD 三字段读写 + 工具端点 `_mcp_run_tools` 分流 + `_mcp_row_out` 回显 |
+| `src/engine/agent_engine.py` | 两处 mcp_call 上下文改 `_mcp_ctx(mcp_row)`（删旧手工组装 + 未用 import） |
+
+## 3. 自测证据（RISK-015 隔离，全程未动线上 agp-app:8099 / pg-unified agp schema / gw-nginx）
+
+### 3.1 sqlite（宿主 venv TestClient，库在 05-temp/t053/）— **20/20 PASS**
+`05-temp/t053/test_t053_mcp_http.py`（pytest，证据 `test_t053_mcp_http.py` + 运行日志）：
+| # | 用例 | 结果 |
+|---|---|---|
+| 1 | 迁移：全新卷 schema 建表含三列 + 种子 demo 行 stdio/''/{} | PASS |
+| 2 | 迁移：1.5.0 旧库（无三列）在线 ALTER 幂等补齐 + 存量行默认 stdio | PASS |
+| 3-5 | CRUD：http 行三字段落库（JSON 文本）/ stdio 默认归一 / PUT 双向切换传输 | PASS |
+| 6-10 | 校验矩阵：http 无 url / 非法 URL×5 / stdio 无 command(含空白) / 非法 transport / HTTP 大写归一 | PASS |
+| 11-12 | stdio demo 零回归：tools/list 两工具 + get_time call + 未知工具 502 | PASS |
+| 13-15 | HTTP 全链路：注册→tools/list 真实 4 工具→add=7→sse_tool(SSE) | PASS |
+| 16 | 401 两态：带 Authorization 200 / 不带 502(含 401+URL) | PASS |
+| 17 | URL 不可达：502 含 URL，<8s 不 hang（connect 5s） | PASS |
+| 18 | SSE --sse-always 全链路：initialize/list/call 全 SSE 流 | PASS |
+| 19 | mcp_call 插件分流：http 行→with_http_session / stdio 行→with_session / 未知工具 ok:false | PASS |
+| 20 | mcp_ctx_from_row 归一（http 行/存量行/None）+ 存量 stdio 行零回归 | PASS |
+
+### 3.2 postgres（docker run 隔离容器 t053-pg:8250，镜像 agp-platform:t053 自本分支构建）— **26/26 PASS**
+- **生产安全隔离方案**（重要）：app 启动 `_pg_bootstrap_schema` 会 `ALTER ROLE current_user SET search_path`——若直接用线上 agp_user + 临时 schema 会**永久改掉线上角色 search_path**（首跑已实测触发并立即恢复）。故改用**专用临时角色 t053_user**（预建临时 schema agp_t053 归其所有），`ALTER ROLE current_user` 只影响测试角色；测毕 DROP ROLE + DROP SCHEMA 全复原。
+- **存量升级实测**：预置 1.5.0 旧结构 mcp_servers（无三列）+ 存量行 `legacy-demo` → app 启动自动 ALTER 补齐三列（psql 核对：transport text / url text / headers jsonb），存量行自动落 stdio/''/{}，command 保留。
+- `05-temp/t053/test_t053_pg.py`（容器内打活着的 PG-backed app：真实 HTTP API + 真实 stdio 子进程 + 真实 httpx；demo HTTP server 容器内 stdlib 起）：迁移/存量、CRUD 三字段、校验矩阵（7 例）、stdio demo 零回归（list/call/502）、HTTP 全链路（list 4 工具/add=7/sse_tool）、401 两态、不可达(<8s)、SSE 全链路——**26/26 PASS**（证据 `05-temp/t053/pg_result.txt`）。
+- **复原核验**：`t053_user` 已删、`pg_namespace` 仅剩 agp、`agp_user rolconfig` 恢复 `search_path=agp, public`、线上 `agp.mcp_servers` 无新增列（0 列）、t053-pg 容器已删。
+
+### 3.3 lint
+- py_compile 全过；ruff（line-length 110）基线对照：82 → 86，新增仅 4 条 BLE001（blind-except，与全代码库既有错误处理模式一致，如 db.py/api1.py 同款），无新错误类别；已消除引入的 1 条 F401（engine 未用 import）。
+
+## 4. 给 TASK-054（前端+文档）/ TASK-055（云天明回归）的提示
+- **API 字段**：`/api/ext/mcp` 增删改查均支持 `transport`（'stdio'|'http'，默认 stdio）/`url`/`headers`（dict）；列表回显含三字段；http 行 `command` 为空串（前端 stdio 态勿因 command 空而报错）。
+- **前端对接点**：ext.js 两态表单——http 态提交 `{name, command:"", transport:"http", url, headers:{k:v}}`；stdio 态照旧 `{name, command, args, env}`（可省略 transport）。列表标记读 `row.transport`。
+- **tools 测试按钮**：`GET /api/ext/mcp/{id}/tools` 与 `POST /api/ext/mcp/{id}/tools/{tool}/call` 已按行 transport 分流，http server 直接可用（无需前端改端点）。
+- **回归重点**：① 存量 stdio 行零回归（demo 行）；② 校验矩阵 400 语义；③ http 401/不可达错误信息可读（含 URL+status）；④ 双 schema（PG 侧注意 `_pg_init` 的 `ADD COLUMN IF NOT EXISTS` 在旧 agp schema 生效）。
+- **已知问题**：
+  1. 无（阻塞级）。SSE 响应里 server 若不发结果帧（只发 notification）会报 "SSE 流未返回结果帧"（协议边界，真实 server 均发结果帧）。
+  2. `MCPSessionHTTP` 不支持 server 主动 push 通知（本迭代范围外，mcp_call 仅 request/response）。
+  3. headers 值强制转 str（HTTP 头约束），与 env 同语义。
+
+## 5. 部署
+- 本卡为**后端代码交付**（feat/mcp-http 分支，未 merge/push），部署由 TASK-056 终审后随 1.6.0 统一进行；自测容器（t053-pg:8250）已拆除，无新增常驻组件/端口/卷——**SERVER_REGISTRY.md 无需新增登记**（无长期资源变更；临时角色/临时 schema 已复原，pg-unified 数据面零改动）。
+- 镜像 `agp-platform:t053` 为自测临时镜像（本分支构建，可删），不占台账。
+
+## 6. 铁律核对
+- RISK-015：自测容器一律 docker run 独立名+端口（t053-pg:8250），未从外部目录起项目 compose 同名容器；线上 agp-app/pg-unified agp schema/gw-nginx 全程未动（agp_user search_path 首跑误触已立即恢复并核验）。
+- 临时文件全 05-temp/t053/（venv/测试/demo server/env/日志），零 /tmp。
+- 不引入新依赖（httpx 既有）；未 push、未 merge main、未打 tag（终审后由 TASK-056 执行）。

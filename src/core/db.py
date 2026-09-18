@@ -198,6 +198,19 @@ async def _pg_init():
                 await c.execute(ddl)
             except Exception as e:
                 failed.append((ddl[:60], type(e).__name__, str(e)[:120]))
+        # TASK-053 迭代4: 旧库在线补齐 mcp_servers 传输列（1.5.0 及更早的
+        # agp schema 无这三列；CREATE IF NOT EXISTS 不会给已存在的表加列）。
+        # ADD COLUMN IF NOT EXISTS 幂等——存量行自动落默认值
+        # （transport='stdio' / url='' / headers='{}'），零回归。
+        for ddl in (
+            "ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS transport TEXT DEFAULT 'stdio'",
+            "ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS url TEXT DEFAULT ''",
+            "ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS headers JSONB DEFAULT '{}'::jsonb",
+        ):
+            try:
+                await c.execute(ddl)
+            except Exception as e:
+                failed.append((ddl[:60], type(e).__name__, str(e)[:120]))
         if failed:
             for ddl_head, tname, msg in failed:
                 log.warning("schema_pg.sql 建表/补列失败（降级）: %s: %s %s", tname, ddl_head, msg)
@@ -306,6 +319,11 @@ async def _sqlite_init():
         # backend NOT NULL DEFAULT 'custom'：旧行自动落 custom（内置引擎），零感知。
         "ALTER TABLE agents ADD COLUMN backend TEXT NOT NULL DEFAULT 'custom'",
         "ALTER TABLE agents ADD COLUMN hermes_profile TEXT",
+        # TASK-053 迭代4: mcp_servers 传输字段（'stdio'|'http'）+ http 端点/请求头。
+        # 存量行 transport 默认 'stdio'、url 空串，零回归。
+        "ALTER TABLE mcp_servers ADD COLUMN transport TEXT DEFAULT 'stdio'",
+        "ALTER TABLE mcp_servers ADD COLUMN url TEXT DEFAULT ''",
+        "ALTER TABLE mcp_servers ADD COLUMN headers TEXT DEFAULT '{}'",
     ):
         try:
             await conn.execute(ddl)
