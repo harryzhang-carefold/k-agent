@@ -37,7 +37,7 @@ services:
     build:
       context: ./src
       dockerfile: Dockerfile
-    image: agp-platform:1.6.0
+    image: agp-platform:1.6.1
     container_name: agp-app
     restart: unless-stopped
     env_file:

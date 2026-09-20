@@ -170,7 +170,7 @@ tests/           pytest 套件（auth/agents/chat/rag/memory/mcp/longtext/ws）
 
 | 项 | 值 |
 |---|---|
-| 镜像 | `agp-platform:1.6.0`（build: `./src/Dockerfile`, python:3.12-slim；阶段六含 Hermes Agent 双后端接入，迭代4 含 MCP 双传输。回滚锚点 `1.5.0`/`1.4.0`/`1.3.0` 保留） |
+| 镜像 | `agp-platform:1.6.1`（build: `./src/Dockerfile`, python:3.12-slim；阶段六含 Hermes Agent 双后端接入，迭代4 含 MCP 双传输，1.6.1 含 BUG-011 MCP HTTP 通知 2xx 兼容。回滚锚点 `1.6.0`/`1.5.0`/`1.4.0`/`1.3.0` 保留） |
 | 容器名 | `agp-app`，`restart: unless-stopped` |
 | 端口 | `8099:8099` |
 | 卷 | `agpdata:/app/data`（named volume，持久化 `agp.db`，sqlite 模式重启/重建不丢；**无需 chown 宿主目录**，属主由 Docker 管理，容器内 uid 1000 可直接写）；**Hermes（可选）**: `/home/hermes/.hermes:/home/hermes/.hermes`（宿主 hermes 运行时：venv + profiles + .env）+ `/home/hermes/.local/share/uv:/home/hermes/.local/share/uv`（venv python 符号链接目标）。未挂载的环境 hermes 功能优雅 503，custom 不受影响。显式 bind 卷用户见下方「从 bind 卷迁移到 named volume」 |
@@ -183,7 +183,7 @@ tests/           pytest 套件（auth/agents/chat/rag/memory/mcp/longtext/ws）
 MCP server 支持**两种传输**，可并存（`mcp_servers.transport` 字段，`'stdio'` / `'http'`）：
 
 - **stdio**：本地可执行命令。平台 spawn 子进程，用 LSP `Content-Length` 帧做 JSON-RPC。需 `command`（可执行程序）+ `args` + 可选 `env`。
-- **http（Streamable HTTP）**：远程/容器化 MCP server 的 HTTP 端点。JSON-RPC over POST 单端点，响应可为 JSON 或 SSE 流，自动处理 `Mcp-Session-Id` 会话头。**无需本地可执行程序**，只需 `url`（http(s) 端点地址）+ 可选 `headers`（自定义请求头，如 `Authorization`）。超时默认 10s（connect 5s）。
+- **http（Streamable HTTP）**：远程/容器化 MCP server 的 HTTP 端点。JSON-RPC over POST 单端点，响应可为 JSON 或 SSE 流，自动处理 `Mcp-Session-Id` 会话头。**无需本地可执行程序**，只需 `url`（http(s) 端点地址）+ 可选 `headers`（自定义请求头，如 `Authorization`）。超时默认 10s（connect 5s）。通知（`notifications/*`）的 2xx 响应一律视为成功、不解析 body（兼容 server 在 202 里放占位 JSON，如 `{"received":true}`——BUG-011，1.6.1 修复，MCP Streamable HTTP 2025-03-26 规范）。
 
 校验矩阵（`POST`/`PUT /api/ext/mcp`）：`transport=http ⇒ url 非空且为合法 http(s) URL`（否则 400）；`transport=stdio ⇒ command 非空`（否则 400）；http 行 `command` 存空串（command 保持 stdio 专属语义）。
 

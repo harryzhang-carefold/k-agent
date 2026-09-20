@@ -2487,3 +2487,57 @@ V1 非法 transport `ftp` → 400 · V2 http 无 url → 400 · V3 http 非法 u
 2. **RISK-023 遗留**：建议轮换 `AI_MODEL_API_KEY` + `JWT_SECRET`（.env.bak 历史镜像泄漏 + 短 JWT），destructive 操作交用户。
 3. **LLM 工具调用 flakiness（P2 非阻塞，模型层）**：对话链路偶发不触发 mcp_call（vllm-qwen3.8-27b 层，非应用缺陷）——引擎 HTTP 分流由 H4 + 确定性 tools/call 已证明，不影响 1.6.0 交付。
 4. **SSE 流边界（P3 观察）**：若 server 只发 notification 帧不发结果帧，客户端报"未返回结果帧"（协议边界，真实 server 均发结果帧，本卡 S2 已验证正常消费）。
+
+
+---
+
+# BUG-011 · MCP HTTP 通知 2xx 兼容 + PM 独立黑盒终审 + merge main + push + tag 1.6.1 + 交付（2026-09-20，褚岩，t_8dff373e）
+
+> 终审人：褚岩（PM）。**独立黑盒**：不采信上游（t_9faf7919 章北海修复 / t_8b04170c 云天明回归）自测，全部由本卡从干净上下文独立 build + 隔离容器 + 自写 harness 复现。RISK-015 铁律：全程隔离容器（独立名 t8df373e-* + 独立网络 + 独立端口 18199/18198 + 独立 PG），线上 agp-app(1.4.0/8099)/pg-unified/gw-nginx 零改动。
+
+## 1. 缺陷与修复
+- **现象**：真实远程 MCP server（carefold-base-mcp，uvicorn，Streamable HTTP）在 1.6.0 平台注册后 tools/调用全失败：`MCP HTTP 非 JSON-RPC 响应（202）...: {"received": true}`。
+- **根因**：握手第 2 步 `notifications/initialized` 收到 202+非空 body，`MCPSessionHTTP._post()` 原代码只兼容 202 空体，非空 body 落进 `resp.json()` → 无 `jsonrpc` → 抛错中断握手。
+- **修复**（章北海 t_9faf7919，commit `ec53ff5`，分支 `fix/mcp-202-notify`，base main@a3f2a5f=tag 1.6.0）：`src/mcp/mcp_client.py` `_post()` 在 4xx/5xx 检查之后、SSE 分支之前新增 `if notify and resp.status_code < 300: return None`（通知 2xx 一律成功、不解析 body，MCP Streamable HTTP 2025-03-26 规范）；删除被覆盖的旧"202 空体"判断（死代码）。非通知请求行为零变化（4xx/5xx 报错格式含 URL+status+body 前 200、SSE 消费、id 匹配均不动）。改动 2 文件：`src/mcp/mcp_client.py`（+6/-2）+ 新增 `tests/test_mcp_http_notify_202.py`（352 行）。
+
+## 2. 独立构建（黑盒起点）
+- 干净上下文：`git archive fix/mcp-202-notify @ ec53ff5`（79 条目，仅 02-development 仓库内容）→ `05-temp/t_8dff373e/t-8dff373e-src/`（不复用 t-bug011 任何构建产物/镜像）。
+- 独立 build：`docker build -t agp-platform:1.6.1`（不复用 1.6.1-rc）。
+- 源码逐字节核对：归档内 `mcp_client.py` md5=`038c2c8e...` = `git show fix/mcp-202-notify:src/mcp/mcp_client.py`；`requirements.txt` md5=`791b6ad4...` 一致；两容器内 `/app/mcp/mcp_client.py` 与归档逐字节一致。
+- 修复逻辑独立确认（读归档源码 line ~265）：`status>=400 → raise`（先于 notify 分支，通知 4xx 仍报错）→ `notify and <300 → return None` → SSE 分支 → json 解析。
+
+## 3. 隔离环境（RISK-015）
+- 网络 `t8df373e-net`（独立）；独立 PG `t8df373e-pg`（fresh 用户 t8df_user + schema agp_t8df373e，**非 pg-unified**）；2 个 app 容器 `t8df373e-app-sqlite:18199` / `t8df373e-app-pg:18198`（agp-platform:1.6.1）。
+- 测试资产：褚岩独立自写 `05-temp/t_8dff373e/final_harness.py`（stdlib urllib，不复用 t-bug011 任何文件）；临时密钥仅运行时注入（envs/*.env，测毕删除）。
+- 证据目录：`05-temp/t_8dff373e/`（harness_final.log、evidence_api_final.json、evidence_ac1/ac2 双 schema json、docker_ps_before/after.txt、envs/、t-8dff373e-src/）。
+
+## 4. 验收标准逐条终审（本卡独立执行）
+| AC | 终审结果 |
+|---|---|
+| AC-1 真实 server 注册 → tools 真实工具 | ✅ sqlite+pg 双 schema：`POST /api/ext/mcp`（transport=http，url=http://34.85.104.227:9010/mcp/）→ `GET /tools` 200，**21 真实工具**含 login/current_user/list_patients/...（非 get_time demo） |
+| AC-2 mcp_call 真实工具成功 | ✅ 双 schema：`POST .../tools/current_user/call` 200 ok=true，返回真实用户（admin/super_admin/org_roles 等完整数据） |
+| AC-3 stdio demo 零回归 | ✅ 双 schema：demo tools/list（get_time+get_patient_demo）+ get_time call 200 + 未知工具 502 受控错误（`未知工具: no_such_tool`） |
+| AC-4 单元级（通知 2xx 四形态） | ✅ 本卡在干净归档上重跑 `tests/test_mcp_http_notify_202.py`（httpx MockTransport）：**13 passed in 0.14s**（202 空体 / 202 {"received":true} / 202 {} / 200 任意 body 四形态均完成握手；session-id 头；非通知 404/500 报错格式不变；通知 4xx 仍报错；id 错配仍报错；SSE 结果帧消费不变；stdio 路径零影响） |
+| AC-5 双 schema 各跑一遍 | ✅ sqlite(18199) + pg(18198 连独立 PG agp_t8df373e，**22 张表直查证实真实 PG schema 写入**) 各完整跑一遍注册+tools+call |
+| 负向（非通知 4xx 报错格式未回退） | ✅ 双 schema：错误路径 401 → 502，message 含 `MCP HTTP 错误 401` + URL + body 前 200（`Missing or invalid Authorization header...`） |
+| 汇总 | **20/20 PASS（双 schema 各 10 项），P0=0 / P1=0** |
+
+## 5. 交付动作（全绿后执行）
+- merge `fix/mcp-202-notify` → `main` + 本终审文档 commit。
+- `git push origin main` + `git push origin tag 1.6.1`（凭 `~/.git-credentials`）。
+- **不检查 CI、不验证 GCP**（沿用 DECISION-024.2 口径）。
+- 文档：README §3.9 MCP http 行补 BUG-011 通知兼容说明 + README §3.8 镜像行 1.6.1（回滚锚点 1.6.0 前置）+ compose `image: agp-platform:1.6.1` + DEV_REPORT 本章。
+
+## 6. 铁律 / 约束终检
+| 约束 | 终检结果 |
+|---|---|
+| RISK-015 隔离线上零改动 | ✅ `docker_ps_before.txt` vs `docker_ps_after.txt` 逐条一致（排除 t8df373e-*）；线上 agp-app(1.4.0/8099)/pg-unified/gw-nginx/astm-* 全程未动 |
+| 零硬编码密钥 | ✅ 修复 commit 改动 2 文件均无密钥；测试密钥仅运行时注入（envs/*.env 600，测毕删除，不进 git） |
+| .env 不进镜像 | ✅ `docker run --rm agp-platform:1.6.1` 探针：`/app/.env` 不存在；`.dockerignore` 排除 `.env` |
+| 临时文件全 05-temp/ | ✅ 全部落 `05-temp/t_8dff373e/`，零 /tmp（测毕容器/网络/卷/PG 全拆，保留 1.6.1 交付镜像） |
+
+## 7. 剩余风险清单（交用户）
+1. **GCP 34.121.9.233:8099 未验证**（DECISION-024.2 口径：本卡不查 CI、不验 GCP）：1.6.1 已 push origin/main + tag，GitHub CI 自动触发部署；若 GCP 侧异常需用户侧读 CI 日志 / 登录 GCP 诊断（本机凭据无 admin 读 CI 日志权限，RISK-027）。
+2. **RISK-023 遗留**：建议轮换 `AI_MODEL_API_KEY` + `JWT_SECRET`（.env.bak 历史镜像泄漏 + 短 JWT），destructive 操作交用户。
+3. **真实 server 依赖**：本终审 AC-1/2 依赖 `http://34.85.104.227:9010/mcp/` 在线可用；该 server 为外部组件，其可用性不在本项目交付范围。
+4. **线上 8099 仍跑 1.4.0**：本地 docker compose 的 agp-app 为 1.4.0（未升级），1.6.1 交付以 origin/main + tag 为准；如需本地升级到 1.6.1 需用户确认（会动线上容器，RISK-015 禁止本卡执行）。
