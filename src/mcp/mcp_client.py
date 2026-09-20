@@ -262,10 +262,14 @@ class MCPSessionHTTP:
         if resp.status_code >= 400:
             body = (resp.text or "")[:200]
             raise MCPError(f"MCP HTTP 错误 {resp.status_code} {self.url}: {body}")
+        if notify and resp.status_code < 300:
+            # 通知（notifications/*，无 id）：按 MCP Streamable HTTP 规范
+            # （2025-03-26），通知的 2xx 响应 body 不是 JSON-RPC 响应，
+            # 客户端应直接忽略、不解析。实践中大量 server 在 202/200 里放
+            # 占位 JSON（如 {"received":true}、{}）——一律视为成功。
+            return None
         if "text/event-stream" in ct:
             return await self._consume_sse(resp, expect_id=msg.get("id"))
-        if notify and not (resp.content or b"").strip():
-            return None  # 通知：202 空体（协议允许）
         try:
             r = resp.json()
         except Exception:
