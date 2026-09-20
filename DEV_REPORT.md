@@ -2664,3 +2664,79 @@ PG 侧 `trace_conversations`/`trace_spans` 两表已建（`psql pg_tables` 核�
 - 镜像 `agp-platform:1.7.0` 已 build；生产容器已升级到 1.7.0 并验证可运行。
 - 移交测试（云天明）：重点回归 chat/run 路径（chat_stream 签名变更）+ hermes 后端 +
   /api/trace 权限 + 非阻塞（trace 表故障不影响对话）。
+
+---
+
+# TASK-058 · 迭代5 前端：ext.js "链路追踪" tab + 时间线视图（2026-09-20，章北海，t_ee86a2cd）
+
+## 1. 交付范围（任务书 §5 全部落地）
+| # | 需求 | 实现 |
+|---|---|---|
+| 1 | ext.js 新增"链路追踪"tab | `src/static/ext.js` 新增 trace 面板（页面底部 `#trc-panel`，独立局部刷新，零回归上方 Skills/MCP/Plugins/长文本区） |
+| 2 | 会话列表（时间/agent/模型/token 总量/工具数/状态，可点进详情） | `_trcListHTML()` 渲染表格 6 列 + 按 agent 下拉过滤 + 刷新按钮 + 行点击进详情 |
+| 3 | 会话详情：时间线视图（每 span 一行：时间/类型图标/名称/耗时/token/展开看 input-output） | `_trcDetailHTML()` 时间线：序号/图标/名称/时间/耗时/token/状态 + 展开体（input/output 自动美化 JSON） |
+| 4 | rag_search 展开可见具体 chunk 列表 | 展开体渲染 `rag_chunks`（chunk 序号/kb#/score/preview，具体到 chunk） |
+| 5 | 空态/错误态/加载态（沿用现有 UI 规范） | `_trcState` 状态机 idle/loading/ok/empty/error；错误态含重试按钮；非 admin 显示无权限提示 |
+| 6 | 文档：README "链路追踪"节补充前端使用说明 | `README.md` §3.10 追加前端 tab 使用说明（列表/详情/三态/零回归） |
+
+## 2. 关键设计决策
+1. **数据源 = TASK-057 真实 `/api/trace` 接口**（非 mock）：
+   - 列表：`GET /api/trace/conversations?agent_id=&limit=&offset=`（admin 专属，前端 `system:admin` 守卫）
+   - 详情：`GET /api/trace/conversations/{conv_id}`（聚合 + 全部 spans 按 seq 升序）
+2. **前端权限守卫**：非 `system:admin` 账号 `renderTracePanel()` 直接渲染"无权限"提示、**不发请求**（后端同样 403，双保险，不泄露任何 trace 数据）。admin 才 `trcLoad()`。
+3. **局部刷新（零回归铁律）**：trace 面板是独立 `#trc-panel` 节点，`trcLoad/trcOpen/trcBack/trcToggle` 只改该节点 `innerHTML`，**不整块重绘 `#page-ext`**（否则像 BUG-006 那样清掉其他 panel 的用户状态）。
+4. **span_type → 图标/文案映射**（对齐任务书 8 枚举）：🧠llm_call / 🔧tool_call / 🔌mcp_call / 📚rag_search / 🧩skill_inject / 📄file_op / ⚡cache_hit / ⚠️error。
+5. **input/output 美化**：`_trcPretty()` 尝试 `JSON.parse→stringify(2)`，失败原样（兼容 JSON 字符串 / 纯文本 / 已截断的 2000 字符）。
+6. **token 展示**：仅 `llm_call`（或带 tokens 的 span）显示 `tok in/out` + model；其余 span 不显示 token（避免误导）。
+7. **agent 下拉数据源**：复用 app.js 全局 `agentsCache`；`trcLoad` 时若未填充则补拉 `GET /api/agents`（ext 页可能先于 agents 页加载）。
+
+## 3. 自测与验证（RISK-015 隔离，禁动线上 8099/agp-app/pg-unified/gw-nginx）
+**隔离环境**：`docker build` 当前 feat/trace 源码（含本卡前端）→ `agp-platform:t058-test` → `docker run -p 8615:8099` + sqlite + 真实 LLM（vllm-qwen3.8-27b @ 34.121.9.233:4000）。`05-temp/t058/`（build_env.py / api_test.py / dom_test.py / shots.py / t058.env）。
+
+### 3.1 API 级自测（真实 /api/trace 数据，`api_test.py`）— **13/13 PASS**
+建 custom agent（绑 skill+rag）→ 发一条触发 rag 检索 + LLM 的消息 → 验证：
+- 列表 200 / 有数据 / `retention_days=30`
+- 详情 200 / spans 非空
+- span 类型含 `skill_inject` + `rag_search` + `llm_call`
+- **rag_search 含 chunk 粒度**（`knowledge_id=2 / chunk_seq=0 / score=0.2904 / preview=...`）
+- **llm_call 真实 token**（in=394 / out=19，>0）+ **model 名**（vllm-qwen3.8-27b）
+- 聚合行 `total_tokens_in=394` / `models=[vllm-qwen3.8-27b]` / `rag_kb=[{id:2,name:t058-kb}]`
+- **viewer 访问 /api/trace → 403**
+
+### 3.2 前端 DOM 自测（Playwright 真实 Chromium，隔离 app :8615，`dom_test.py`）— **37/37 PASS**
+- 零回归：Skills / MCP / Plugins / 长文本 4 策略 panel 全在
+- 链路追踪面板存在 + 标题
+- **会话列表**：表格 6 列（开始时间/Agent/模型/token/工具数/状态）+ agent 名 t058-trace-agent + token 394 + 模型 badge + 过滤下拉
+- **时间线**：`.trc-timeline` 容器 + 返回按钮 + span 行 ≥3 + RAG 检索/LLM 调用/Skill 注入行 + token 数 + 耗时
+- **rag chunk 展开**：展开后"命中 chunk (3)" + chunk 序号 + kb#2 + score + preview 文本（王建国）+ 按钮变"收起"
+- **LLM 展开**：显示 input / output
+- 返回列表正常
+- **三态**：空态（过滤无数据 agent → "暂无 trace 数据"）/ 错误态（`trcOpen('nonexistent')` 404 → "加载失败" + 重试按钮）
+- **非 admin**：viewer 看到"system:admin 403"无权限提示 + 不渲染任何 trace 数据
+- **JS 控制台无未捕获异常**（2 条 404 资源日志为错误态测试故意触发，属预期）
+- 截图：`05-temp/t058/01_trace_list.png`（列表）/ `02_trace_detail_rag_chunks.png`（详情+rag chunk 展开），vision 复核排版正常
+
+## 4. 部署（章北海职责：交付可运行环境）
+- **本卡纯前端改动**（ext.js / style.css / README），无后端代码变更、无新镜像层依赖，**不改 compose、不动生产 agp-app**。
+- 自测用隔离容器 `agp-t058`（8615）验证前端可渲染真实 `/api/trace` 数据；线上 agp-app（1.7.0，已含 TASK-057 后端 trace 接口）升级镜像后，本前端改动随 `agp-platform:1.7.0` 镜像的 `src/static` 一起生效（前端静态文件由 app 容器直接 serve）。
+- **前端随镜像分发**：`src/static/*` 在 Dockerfile `COPY . .` 层内，`agp-platform:1.7.0` 重新 build 后包含本卡前端。生产已 build 的 1.7.0 镜像需**重新 build**（COPY 层更新）才能让线上 8099 加载新 trace 面板——本卡只 commit+push 分支，**不重新 tag/不 push main**（由 PM 终审卡统一决定）。
+- 台账（SERVER_REGISTRY.md）：本卡无新增/修改组件/端口/镜像，**无需更新台账**（agp-app 行保持 1.7.0）。
+
+## 5. 铁律 / 约束终检
+- [x] 未 push main、未打 tag（只 commit + push feat/trace 分支）
+- [x] 测试容器一律 docker run 隔离（agp-t058 :8615），未动线上 8099/agp-app/pg-unified/gw-nginx
+- [x] 临时文件放 05-temp/t058/（未放 02-development/ 外、未进 git）
+- [x] .env 密钥不进 git（t058.env 在 05-temp/ 且含真实 key，不提交）
+- [x] 前端零回归（原 4 个 panel 全保留，局部刷新不重绘 #page-ext）
+- [x] 前端沿用现有 UI 规范（.panel/.tag/.k/.err/.tip-wrap + 新增 .trc-* 样式）
+
+## 6. 已知问题 / 风险（交测试 + 用户）
+1. **生产 8099 需重新 build 1.7.0 镜像**才能让线上加载本 trace 前端（COPY 层更新）；当前线上 agp-app 镜像是 TASK-057 build 的（无本前端）。本卡不 tag、不 push main，由 PM 终审卡统一 build+tag+push 1.7.0。
+2. **agent 过滤下拉**依赖 `GET /api/agents`（需 `agent:read` 权限，admin 有）；若某 admin 账号无 agent:read，下拉留空但不影响 trace 列表本体（try/catch 兜底）。
+3. **列表 limit=100**（前端固定），超大会话数场景可滚动分页（当前未加分页，trace 保留 30 天 + limit 500 后端上限，100 条足够演示；如需更多可在下拉过滤）。
+4. **hermes 后端 span** 的 llm_call token 为 NULL（TASK-057 既定，hermes CLI 无 usage），前端 token 列显示"—"（不编造）。
+
+## 7. 交付动作
+- 分支 `feat/trace` 累计 commit（在 TASK-057 415a4e5 之上）：本卡 commit = 前端 trace tab + style + README。
+- push origin feat/trace（**不 push main、不 tag**）。
+- 移交测试（云天明）：重点 ① admin 登录后 MCP-Skills 页底部 trace 面板三态 ② 详情时间线 rag chunk 展开 ③ 非 admin 无权限 ④ 原 4 个 panel 零回归。

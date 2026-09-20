@@ -240,6 +240,12 @@ curl -s -H "Authorization: Bearer <admin-token>" \
 ```
 非 admin（developer/user/viewer）访问 `/api/trace/*` 一律 **403**（不返回任何 trace 数据）。
 
+**前端「链路追踪」tab（迭代5，1.7.0）**：登录 **admin** 后进入 **MCP-Skills** 页面，页面底部为「链路追踪」面板：
+- **会话列表**：时间 / agent（含后端 badge）/ 模型 / token 总量（in/out · LLM 次数）/ 工具数 / 状态；可按 agent 下拉过滤；点行进入详情。
+- **会话详情（时间线视图）**：每个 span 一行——序号 / 类型图标（🧠LLM · 🔧工具 · 🔌MCP · 📚RAG · 🧩Skill · 📄文件 · ⚡缓存 · ⚠️错误）/ 名称 / 时间 / 耗时 / token / 状态；点「展开」看该步 `input`/`output`（JSON 自动美化），**`rag_search` 展开可见命中 chunk 列表**（`knowledge_id` / `chunk_seq` / `score` / `preview`，具体到 chunk）。
+- **三态**：加载态（"加载 trace 会话列表…"）、空态（"暂无 trace 数据"）、错误态（显示后端错误信息 + 重试按钮，如 403 无权限）；非 admin 账号直接显示无权限提示（不发请求）。
+- 面板为独立局部刷新（`#trc-panel`），刷新/展开不影响页面上方 Skills / MCP / Plugins / 长文本 4 策略区域（零回归）。
+
 ## 4. 部署与启动
 
 前置：一个可达的 OpenAI 兼容 LLM 端点。**默认 SQLite 模式无需任何数据库外部依赖**；仅 PG 模式需要一个 PostgreSQL（独立 `pg-unified` 容器，需已建 `agp` schema 与 `agp_user` 用户；参考 postgres-unified 项目的 docker-compose）。

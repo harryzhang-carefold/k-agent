@@ -6,6 +6,11 @@
  *   - MCP   ：列表(传输标记 stdio/http + enabled 开关) + 新建/编辑(传输两态表单：
  *             stdio=command/args/env；http=url/headers) + 删除 + 保留 tools/list 与 call 测试
  *   - Plugins / 长文本4策略 / HITL：保持原有只读能力
+ *   - TASK-058 迭代5：链路追踪（trace）面板（页面底部，仅 system:admin 有数据）：
+ *       会话列表（时间/agent/模型/token 总量/工具数/状态，可按 agent 过滤）
+ *       + 会话详情时间线（每个 span 一行：序号/类型图标/名称/时间/耗时/token/状态，
+ *         展开看 input/output；rag_search 展开可见命中 chunk 列表）
+ *       + 三态（加载态/空态/错误态，沿用现有 UI 规范）
  *
  * 权限：无 ext:manage 时写入入口禁用（canManage() 守卫）。
  *
@@ -26,6 +31,11 @@
   // 表单暂存（编辑中的 skill/mcp 对象）
   let _skillEditId = null;
   let _mcpEditId = null;
+
+  // ---------- TASK-058: 链路追踪（trace）面板状态 ----------
+  let _trcConvs = [];   // 当前会话聚合列表（GET /api/trace/conversations）
+  let _trcSpans = [];   // 当前详情视图的 spans（按 seq 升序）
+  let _trcAgentQ = null; // 按 agent 过滤（agent id 或 null=全部）
 
   // ---------- TASK-030: info tooltip（纯 CSS hover，原生实现无依赖） ----------
   function _tipBox(content) {
@@ -89,7 +99,261 @@
           '</strong> <div class="k">' + esc(p.description) + '</div>' +
           '<button class="small" onclick="extCallPlugin(\'' + p.name + '\')">调用</button>' +
           '<pre id="pl-' + p.name + '"></pre></div>').join('') + '</div>' +
-      renderLongtextPanel(lt);
+      renderLongtextPanel(lt) +
+      // TASK-058: 链路追踪面板（独立 #trc-panel，局部刷新不重绘其他 panel）
+      '<div id="trc-panel">' + renderTracePanel() + '</div>';
+    // 非 admin 不需要拉数据（面板内已给出无权限提示）；admin 才加载会话列表（拉取失败 → 错误态）
+    if (me && me.permissions && me.permissions.includes('system:admin')) {
+      trcLoad();
+    }
+  }
+
+  // ---------- TASK-058: 链路追踪（trace）面板 ----------
+  // 数据来源：GET /api/trace/conversations?agent_id=&limit=&offset=（仅 system:admin）。
+  // 权限守卫：非 admin 直接走 403 → 错误态（沿用现有 UI 规范，不渲染任何数据）。
+  // 三态：
+  //   加载态 → _trcState = 'loading'（"加载中…"）
+  //   空态   → _trcState = 'empty'（"暂无 trace 数据"）
+  //   错误态 → _trcState = 'error'（显示后端错误信息，如 403 无权限）
+  //   正常态 → _trcState = 'ok'（渲染会话列表 + 可选详情时间线）
+  let _trcState = 'idle';   // idle | loading | ok | empty | error
+  let _trcErr = '';
+  let _trcDetailId = null;  // 当前展开详情的 conv_id（null=仅列表）
+  let _trcRetain = null;    // 保留天数（来自 list 接口的 retention_days）
+
+  // span_type → 图标/标签文案（对齐任务书 span_type 枚举）
+  const _TRC_ICON = {
+    llm_call: '🧠', tool_call: '🔧', mcp_call: '🔌', rag_search: '📚',
+    skill_inject: '🧩', file_op: '📄', cache_hit: '⚡', error: '⚠️',
+  };
+  const _TRC_LABEL = {
+    llm_call: 'LLM 调用', tool_call: '工具', mcp_call: 'MCP', rag_search: 'RAG 检索',
+    skill_inject: 'Skill 注入', file_op: '文件', cache_hit: '缓存命中', error: '错误',
+  };
+
+  function _trcIcon(st) { return _TRC_ICON[st] || '•'; }
+  function _trcLabel(st) { return _TRC_LABEL[st] || esc(st || ''); }
+  function _trcStatusBadge(status) {
+    const s = (status || '').toLowerCase();
+    if (s === 'ok') return '<span class="tag ok">ok</span>';
+    if (s === 'error') return '<span class="tag warn">error</span>';
+    if (s === 'degraded') return '<span class="tag warn">degraded</span>';
+    return status ? '<span class="tag">' + esc(status) + '</span>' : '—';
+  }
+
+  // 会话列表行（时间/agent/模型/token 总量/工具数/状态，可点进详情）
+  function _trcListHTML() {
+    if (!_trcConvs.length) {
+      return '<div class="trc-empty">（暂无 trace 数据 —— 尚无已记录的会话，或已超出保留期被清理）</div>';
+    }
+    const rows = _trcConvs.map(c => {
+      const tools = (c.tools_called || []);
+      const models = (c.models || []);
+      const isDetail = c.id === _trcDetailId;
+      return '<tr class="' + (isDetail ? 'trc-act' : '') + '" style="cursor:pointer" onclick="trcOpen(\'' +
+        esc(c.id) + '\')">' +
+        '<td class="k mono">' + esc(c.started_at || '') + '</td>' +
+        '<td><strong>' + esc(c.agent_name || ('agent#' + c.agent_id)) + '</strong>' +
+          ' <span class="k mono">#' + esc(c.agent_id) + '</span>' +
+          ' ' + (c.backend ? '<span class="tag ' + (c.backend === 'hermes' ? 'herm' : '') + '">' + esc(c.backend) + '</span>' : '') + '</td>' +
+        '<td class="k mono">' + (models.length ? models.map(m => '<span class="tag">' + esc(m) + '</span>').join('') : '—') + '</td>' +
+        '<td class="k">' + (c.total_tokens_in || 0) + ' / ' + (c.total_tokens_out || 0) +
+          ' <span class="k">(' + (c.total_llm_calls || 0) + ' 次)</span></td>' +
+        '<td class="k">' + tools.length + (tools.length ? '<div class="k mono">' + tools.map(t => '<span class="tag">' + esc(t) + '</span>').join('') + '</div>' : '') + '</td>' +
+        '<td>' + _trcStatusBadge(c.status) + (c.error ? '<div class="k err" style="margin-top:2px">' + esc(c.error) + '</div>' : '') + '</td>' +
+      '</tr>';
+    }).join('');
+    return '<table><tr><th>开始时间</th><th>Agent</th><th>模型</th><th>token (in/out · LLM 次数)</th><th>工具数</th><th>状态</th></tr>' +
+      rows + '</table>';
+  }
+
+  // 详情时间线：每个 span 一行（序号/类型图标/名称/时间/耗时/token/状态），可展开 input/output；
+  // rag_search 展开可见命中 chunk 列表（具体到 chunk）。
+  function _trcDetailHTML(conv) {
+    const head = '<div class="panel trc-detail-head" style="background:var(--panel2);margin-top:10px">' +
+      '<div class="row" style="align-items:center">' +
+        '<button class="small" onclick="trcBack()">← 返回列表</button>' +
+        '<div style="flex:1"><strong>' + esc(conv.agent_name || ('agent#' + conv.agent_id)) + '</strong>' +
+          ' <span class="k mono">conv ' + esc(conv.id) + '</span> ' + _trcStatusBadge(conv.status) + '</div>' +
+      '</div>' +
+      '<div class="k" style="margin-top:8px">' +
+        '开始 ' + esc(conv.started_at || '—') + ' · 结束 ' + esc(conv.ended_at || '—') + ' · 总耗时 ' +
+        (conv.duration_ms != null ? conv.duration_ms + ' ms' : '—') +
+        ' · LLM 次数 ' + (conv.total_llm_calls || 0) + ' · token ' +
+        (conv.total_tokens_in || 0) + '/' + (conv.total_tokens_out || 0) +
+        (_trcErr ? ' <span class="err">' + esc(_trcErr) + '</span>' : '') +
+      '</div></div>';
+
+    if (!(_trcSpans && _trcSpans.length)) {
+      return head + '<div class="trc-empty">（该会话无 span 明细）</div>';
+    }
+
+    const rows = _trcSpans.map(s => {
+      const ti = (s.tokens_in != null ? s.tokens_in : '—') + ' / ' + (s.tokens_out != null ? s.tokens_out : '—');
+      const dur = s.duration_ms != null ? (s.duration_ms + ' ms') : '—';
+      const hasBody = (s.input || s.output || (s.rag_chunks && s.rag_chunks.length));
+      const toggle = hasBody
+        ? '<button class="small" style="flex:0 0 auto" onclick="trcToggle(' + s.id + ')">展开</button>'
+        : '';
+      // 展开体：input/output（JSON 友好）+ rag_search 的 chunk 列表
+      let body = '';
+      if (hasBody) {
+        body = '<div class="trc-body" id="trc-body-' + s.id + '" style="display:none">';
+        if (s.rag_chunks && s.rag_chunks.length) {
+          body += '<div class="k">📚 命中 chunk（' + s.rag_chunks.length + '）</div>' +
+            '<div class="trc-chunks">' +
+            s.rag_chunks.map((c, i) =>
+              '<div class="trc-chunk">' +
+              '<span class="tag acc">chunk ' + (c.chunk_seq != null ? c.chunk_seq : (i + 1)) + '</span>' +
+              (c.knowledge_id != null ? ' <span class="k mono">kb#' + esc(c.knowledge_id) + '</span>' : '') +
+              (c.score != null ? ' <span class="k">score ' + esc(c.score) + '</span>' : '') +
+              '<div class="trc-chunk-txt">' + esc(c.preview || c.text || '') + '</div></div>').join('') +
+            '</div>';
+        }
+        if (s.input) {
+          body += '<div class="k">输入 input</div><pre class="trc-io">' + esc(_trcPretty(s.input)) + '</pre>';
+        }
+        if (s.output) {
+          body += '<div class="k">输出 output</div><pre class="trc-io">' + esc(_trcPretty(s.output)) + '</pre>';
+        }
+        if (s.error) {
+          body += '<div class="k">错误</div><pre class="trc-io">' + esc(s.error) + '</pre>';
+        }
+        body += '</div>';
+      }
+      return '<div class="trc-row">' +
+        '<div class="trc-line">' +
+          '<span class="trc-idx">' + (s.seq != null ? s.seq : '·') + '</span>' +
+          '<span class="trc-icon" title="' + esc(s.span_type || '') + '">' + _trcIcon(s.span_type) + '</span>' +
+          '<span class="trc-name">' + _trcLabel(s.span_type) + ' ' +
+            (s.name ? '<span class="mono">' + esc(s.name) + '</span>' : '') + '</span>' +
+          '<span class="k mono trc-ts">' + esc(s.ts || '') + '</span>' +
+          '<span class="k">' + dur + '</span>' +
+          (s.span_type === 'llm_call'
+            ? '<span class="k">tok ' + ti + (s.model ? ' · ' + esc(s.model) : '') + '</span>'
+            : (s.tokens_in != null || s.tokens_out != null ? '<span class="k">tok ' + ti + '</span>' : '')) +
+          _trcStatusBadge(s.status) +
+          toggle +
+        '</div>' + body + '</div>';
+    }).join('');
+    return head + '<div class="trc-timeline">' + rows + '</div>';
+  }
+
+  // input/output 可能是 JSON 字符串或纯文本 → 尝试美化 JSON，失败原样
+  function _trcPretty(v) {
+    try { return JSON.stringify(JSON.parse(v), null, 2); }
+    catch (e) { return String(v); }
+  }
+
+  function renderTracePanel() {
+    const isAdmin = !!(me && me.permissions && me.permissions.includes('system:admin'));
+    // 非 admin：不请求数据，直接给出只读/无权限提示（后端同样 403，不泄露数据）
+    if (!isAdmin) {
+      return '<div class="panel"><h3>链路追踪' + _tipBox(
+        '全链路 trace 记录：每次对话记录 LLM/工具/MCP/RAG(到 chunk)/skill/文件/缓存/错误 各步骤。\n' +
+        '仅 system:admin 可查询（安全优先，不跨 agent 泄露）。当前账号无 system:admin 权限。') + '</h3>' +
+        '<div class="k">你当前没有 <span class="tag warn">system:admin</span> 权限，trace 查询接口（/api/trace/*）会返回 403。</div></div>';
+    }
+
+    // 视图二选一：列表 或 详情
+    if (_trcDetailId) {
+      const conv = _trcConvs.find(c => c.id === _trcDetailId);
+      const body = _trcState === 'loading'
+        ? '<div class="trc-loading">加载 span 明细中…</div>'
+        : _trcState === 'error'
+          ? '<div class="err">加载失败：' + esc(_trcErr) + ' <button class="small" onclick="trcOpen(\'' + esc(_trcDetailId) + '\')">重试</button></div>'
+          : (conv ? _trcDetailHTML(conv) : '<div class="err">会话不存在</div>');
+      return '<div class="panel"><h3>链路追踪 · 会话详情</h3>' + body + '</div>';
+    }
+
+    // 列表态
+    const body =
+      _trcState === 'loading'
+        ? '<div class="trc-loading">加载 trace 会话列表…</div>'
+        : _trcState === 'error'
+          ? '<div class="err">加载失败：' + esc(_trcErr) + ' <button class="small" onclick="trcLoad()">重试</button></div>'
+          : _trcState === 'empty'
+            ? '<div class="trc-empty">（暂无 trace 数据）</div>'
+            : _trcListHTML();
+    return '<div class="panel"><h3>链路追踪' + _tipBox(
+      '每次对话的完整执行链路（迭代5 全链路 trace）。\n' +
+      '· 会话列表：时间/agent/模型/token 总量/工具数/状态，点行进入详情。\n' +
+      '· 详情时间线：每个 span 一行（LLM/工具/MCP/RAG/skill/文件/缓存/错误），可展开看 input/output。\n' +
+      '· rag_search 展开可见命中 chunk 列表（knowledge_id/chunk_seq/score/preview）。\n' +
+      '仅 system:admin 可查（/api/trace/*，不跨 agent 泄露）。保留 ' +
+      (_trcRetain != null ? _trcRetain + ' 天' : 'N 天（默认 30，settings 表可配）') + '。') + '</h3>' +
+      '<div class="row" style="margin-bottom:10px">' +
+        '<div style="flex:0 0 240px"><label>按 Agent 过滤</label>' +
+        '<select id="trc-agent" onchange="trcFilter(this.value)">' +
+          '<option value=""' + (_trcAgentQ == null ? ' selected' : '') + '>全部 agent</option>' +
+          (agentsCache || []).map(a =>
+            '<option value="' + a.id + '"' + (_trcAgentQ != null && String(_trcAgentQ) === String(a.id) ? ' selected' : '') + '>' +
+            esc(a.name) + ' (#' + a.id + ')</option>').join('') +
+        '</select></div>' +
+        '<div style="flex:0 0 auto;align-self:flex-end"><button class="small" onclick="trcLoad()">刷新</button></div>' +
+      '</div>' + body + '</div>';
+  }
+
+  async function trcLoad() {
+    _trcState = 'loading'; _trcErr = '';
+    // 确保 agent 下拉有数据（agentsCache 可能还没被 loadAgents 填充）
+    if (!agentsCache.length) {
+      try { agentsCache = (await api('/api/agents')).agents || agentsCache; }
+      catch (e) { /* 下拉留空，不影响 trace 列表本体 */ }
+    }
+    const pg = renderTracePanel();
+    const el = $('#trc-panel');
+    if (el) el.innerHTML = pg;
+    try {
+      let p = '/api/trace/conversations?limit=100';
+      if (_trcAgentQ != null) p += '&agent_id=' + _trcAgentQ;
+      const j = await api(p);
+      _trcConvs = j.conversations || [];
+      _trcRetain = (j.retention_days != null) ? j.retention_days : _trcRetain;
+      _trcState = _trcConvs.length ? 'ok' : 'empty';
+    } catch (e) {
+      _trcState = 'error'; _trcErr = e.message;
+    }
+    const el2 = $('#trc-panel');
+    if (el2) el2.innerHTML = renderTracePanel();
+  }
+
+  function trcFilter(v) {
+    _trcAgentQ = v === '' ? null : parseInt(v, 10);
+    _trcDetailId = null;
+    trcLoad();
+  }
+
+  async function trcOpen(convId) {
+    _trcDetailId = convId; _trcState = 'loading'; _trcErr = '';
+    const el = $('#trc-panel');
+    if (el) el.innerHTML = renderTracePanel();
+    try {
+      const j = await api('/api/trace/conversations/' + encodeURIComponent(convId));
+      _trcSpans = j.spans || [];
+      // 若列表缓存里没有该 conv（如分页外），补一条最小聚合
+      if (!(_trcConvs || []).some(c => c.id === convId)) _trcConvs.unshift(j.conversation || {});
+      _trcState = 'ok';
+    } catch (e) {
+      _trcState = 'error'; _trcErr = e.message;
+    }
+    const el2 = $('#trc-panel');
+    if (el2) el2.innerHTML = renderTracePanel();
+  }
+
+  function trcBack() {
+    _trcDetailId = null; _trcSpans = [];
+    const el = $('#trc-panel');
+    if (el) el.innerHTML = renderTracePanel();
+  }
+
+  function trcToggle(id) {
+    const b = $('#trc-body-' + id);
+    if (!b) return;
+    const open = b.style.display !== 'none';
+    b.style.display = open ? 'none' : 'block';
+    const btn = b.closest('.trc-row').querySelector('button');
+    if (btn) btn.textContent = open ? '展开' : '收起';
   }
 
   // ---------- Skills ----------
@@ -577,4 +841,7 @@
   window.extAddHdrRow = extAddHdrRow; window.extSwitchMcpTransport = extSwitchMcpTransport;
   window.extCloseMcpForm = extCloseMcpForm;
   window.extCallPlugin = extCallPlugin; window.extLtRun = extLtRun; window.extLtPreprocess = extLtPreprocess;
+  // TASK-058: 链路追踪（trace）面板
+  window.trcLoad = trcLoad; window.trcFilter = trcFilter; window.trcOpen = trcOpen;
+  window.trcBack = trcBack; window.trcToggle = trcToggle;
 })();

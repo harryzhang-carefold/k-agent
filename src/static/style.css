@@ -135,3 +135,26 @@ pre { background:#0b0f18; border:1px solid #26314d; border-radius:8px; padding:1
   .tip-box { position:fixed; top:52px; left:10px; right:10px; width:auto; max-width:none;
     max-height:44vh; overflow:auto; }
 }
+/* ---- TASK-058: 链路追踪（trace）面板 ---- */
+.trc-loading { color:var(--dim); font-size:13px; padding:18px 4px; }
+.trc-empty { color:var(--dim); font-size:13px; padding:14px 4px; }
+.trc-timeline { border:1px solid #26314d; border-radius:10px; overflow:hidden; margin-top:4px; }
+.trc-row { border-bottom:1px solid #1a2336; }
+.trc-row:last-child { border-bottom:none; }
+.trc-row:nth-child(odd) { background:rgba(79,140,255,0.03); }
+.trc-line { display:flex; gap:10px; align-items:center; padding:8px 12px; flex-wrap:wrap; font-size:13px; }
+.trc-idx { flex:0 0 26px; text-align:center; color:var(--dim); background:var(--panel2);
+  border:1px solid #2c3a5e; border-radius:6px; padding:1px 4px; font-size:11px; }
+.trc-icon { flex:0 0 auto; font-size:15px; }
+.trc-name { flex:1 1 auto; min-width:120px; }
+.trc-name .mono { color:var(--acc); }
+.trc-ts { flex:0 0 auto; }
+.trc-body { padding:2px 12px 12px 48px; }
+.trc-io { margin:4px 0 8px; max-height:260px; }
+.trc-chunks { margin:4px 0 10px; display:flex; flex-direction:column; gap:6px; }
+.trc-chunk { background:#0b0f18; border:1px solid #26314d; border-radius:8px; padding:8px 10px; }
+.trc-chunk-txt { font-size:12px; color:var(--fg); word-break:break-word; margin-top:4px;
+  font-family:ui-monospace,Menlo,Consolas,monospace; }
+.trc-act { background:rgba(79,140,255,0.10) !important; }
+tr[onclick] { cursor:pointer; }
+tr[onclick]:hover { background:rgba(79,140,255,0.08); }
