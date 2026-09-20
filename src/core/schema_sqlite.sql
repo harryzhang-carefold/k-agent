@@ -172,6 +172,46 @@ CREATE TABLE IF NOT EXISTS skills (
   updated_at TEXT DEFAULT (datetime('now'))   -- TASK-022 / F1: 最近修改时间（新建默认 now，PUT 刷新）
 );
 
+-- 链路追踪（TASK-057 / 迭代5）：agent 全痕迹记录。
+-- trace_conversations = 会话级聚合（一个 conv 一行，id 与 conversations.id 一致）；
+-- trace_spans = 步骤级明细（按 seq 时序）。写入绝不阻塞主链路（见 core/trace.py）。
+CREATE TABLE IF NOT EXISTS trace_conversations (
+  id TEXT PRIMARY KEY,                       -- = conversations.id
+  agent_id INTEGER NOT NULL,
+  agent_name TEXT,
+  backend TEXT,                              -- custom | hermes
+  started_at TEXT, ended_at TEXT,
+  total_tokens_in INTEGER DEFAULT 0,
+  total_tokens_out INTEGER DEFAULT 0,
+  total_llm_calls INTEGER DEFAULT 0,
+  models TEXT,                               -- JSON array（本次会话用到的模型名，去重）
+  tools_called TEXT,                         -- JSON array（工具名，含 mcp:xxx，去重）
+  skills_used TEXT,                          -- JSON array
+  rag_kb_used TEXT,                          -- JSON array（知识库 id+name）
+  files_created TEXT,                        -- JSON array（中间文件路径）
+  duration_ms INTEGER,
+  status TEXT,                               -- ok | degraded | error
+  error TEXT
+);
+
+CREATE TABLE IF NOT EXISTS trace_spans (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  conv_id TEXT NOT NULL,                     -- = trace_conversations.id
+  seq INTEGER NOT NULL,                      -- 会话内顺序（1-based）
+  ts TEXT NOT NULL,
+  span_type TEXT NOT NULL,                   -- llm_call|tool_call|mcp_call|rag_search|skill_inject|file_op|cache_hit|error
+  name TEXT,                                 -- 模型名/工具名/mcp:server/tool/kb名/文件路径
+  input TEXT,                                -- JSON（工具入参 / llm 提示词摘要≤2000 / rag query）
+  output TEXT,                               -- JSON（工具结果≤2000 / llm 回复摘要 / rag 命中 chunk 列表）
+  tokens_in INTEGER,                         -- llm_call 专属
+  tokens_out INTEGER,                        -- llm_call 专属
+  model TEXT,                                -- llm_call 专属
+  rag_chunks TEXT,                           -- rag_search 专属: JSON [{knowledge_id, chunk_seq, score, preview}]
+  duration_ms INTEGER,
+  status TEXT,                               -- ok | error
+  error TEXT
+);
+
 CREATE TABLE IF NOT EXISTS user_roles (
   user_id INTEGER NOT NULL,
   role_id INTEGER NOT NULL,
@@ -186,3 +226,5 @@ CREATE TABLE IF NOT EXISTS users (
 );
 
 -- ==================== INDEXES ====================
+-- 链路追踪（TASK-057 / 迭代5）：会话详情按 conv_id 拉全部 spans（按 seq 排序）。
+CREATE INDEX IF NOT EXISTS idx_trace_spans_conv_id ON trace_spans (conv_id, seq);

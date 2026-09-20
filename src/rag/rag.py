@@ -71,6 +71,18 @@ async def add_document(conn, knowledge_id: int, text: str, chunk_chars: int | No
 
 
 async def search(conn, knowledge_id: int, query: str, top_k: int = 3) -> list[dict]:
+    """检索 top-k chunk，**携带 chunk 元信息**（TASK-057 / 迭代5，DECISION-027 决策4）。
+
+    每项含:
+      - knowledge_id: int  所属知识库 id
+      - chunk_seq:    int  chunk 序号（对应 rag_chunks.seq）
+      - text:         str  分块文本（assemble 拼纯文本用，不变）
+      - score:        float 相似度（余弦）
+      - preview:      str  文本预览（前 120 字符，埋点 rag_chunks 用）
+      - token_est:    int  token 估算
+    旧的 'seq' 字段保留（向后兼容 build_context / 既有调用方），新增 knowledge_id /
+    preview（chunk 粒度埋点所需）。assemble 仍拼纯文本给 LLM（不变）。
+    """
     rows = await db.fetchall(conn, "SELECT * FROM rag_chunks WHERE knowledge_id=? ORDER BY seq",
                              (knowledge_id,))
     qv = await embedding.embed(query)
@@ -80,7 +92,9 @@ async def search(conn, knowledge_id: int, query: str, top_k: int = 3) -> list[di
             sim = embedding.cosine(json.loads(r["embedding"]), qv)
         except Exception:
             continue
-        scored.append({"seq": r["seq"], "text": r["text"], "score": round(sim, 4),
+        scored.append({"seq": r["seq"], "knowledge_id": knowledge_id,
+                       "chunk_seq": r["seq"], "text": r["text"], "score": round(sim, 4),
+                       "preview": (r["text"] or "")[:120],
                        "token_est": r["token_est"]})
     scored.sort(key=lambda x: -x["score"])
     return scored[:top_k]

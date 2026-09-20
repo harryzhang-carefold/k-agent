@@ -25,6 +25,7 @@ from mcp import mcp_client
 from routers.api1 import auth, agents, ext
 from routers.api2 import chat, rag, mem, users, roles, lt, ws_router
 from routers.api_hermes import hermes as hermes_router
+from routers.trace import trace as trace_router
 
 app = FastAPI(title="AI Agent Platform", version="1.0.0")
 
@@ -109,6 +110,17 @@ async def startup():
     # 4. 种子数据
     from seed import seed
     await seed(conn)
+    # 4b. TASK-057 / 迭代5: trace 保留策略——启动时清理过期行（幂等，非阻塞）。
+    #     默认 30 天；settings 表 trace_retention_days 可配（DB > env）。失败只 log，
+    #     不阻断启动（见 core.trace.clean_expired）。
+    try:
+        from core import trace as trace_mod
+        days = await trace_mod.retention_days(conn)
+        cleaned = await trace_mod.clean_expired(conn, days)
+        log.info("AGP trace 保留策略: retention=%d 天，启动清理过期会话 %d 个", days, cleaned)
+    except Exception as e:
+        log.warning("AGP trace 保留策略清理失败（忽略，不阻断启动）: %s: %s",
+                    type(e).__name__, str(e)[:200])
     # 5. TASK-046: 明确就绪标记（供 CI 健康判断 / 日志诊断）。
     # 用 print 直出 stdout（uvicorn --log-level info 下 root logger 实际阈值
     # 为 WARNING，logging.info 在容器日志里不可见——就绪标记必须可见）。
@@ -362,6 +374,7 @@ app.include_router(users)
 app.include_router(roles)
 app.include_router(lt)
 app.include_router(hermes_router)  # TASK-037: /api/hermes/* profile CRUD + status 探测
+app.include_router(trace_router)   # TASK-057: /api/trace/* 链路追踪（system:admin）
 app.include_router(ws_router)
 
 # 静态前端：放在所有 API/WS 路由之后，catch-all 只兜底未匹配路径

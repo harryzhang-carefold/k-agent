@@ -22,6 +22,7 @@
 | **Agent 绑定端到端（阶段五）** | Skill/MCP/RAG/**Plugins（动态下拉 GET /api/ext/plugins）** 四选绑定，保存落库 + Prompt 预览体现生效（工具 schema 注入） |
 | **Hermes Agent 双后端（阶段六）** | Agent 可选 `custom`（内置引擎，零回归）/ `hermes`（hermes CLI profile 后端）：`/api/hermes/profiles` CRUD + `/status` 探测（CLI 缺失优雅 503）；hermes 对话=同步 `hermes -p <profile> -z` + WS 流式（整段 token）+ L0 记忆照写 + 受控降级（不裸 500）；profile 创建即零工具面（仅对话）；api_key 全程脱敏（AC-H9）；双后端（sqlite/PG）幂等迁移 |
 | **Hermes 前端联动（阶段六）** | Agent 表单顶部类型单选 `[自定义 Agent \| Hermes Agent]`（hermes 不可用时选项隐藏+提示，AC-H7）；选 hermes → profile 下拉（`GET /api/hermes/profiles`，含「+ 新建 profile」内嵌创建并自动选中）+ 提示文案（默认仅对话/工具由 profile skills 决定），隐藏 system_prompt/模型/绑定区；选 custom → 原表单零回归；列表 hermes agent 加紫色 `Hermes` badge（模型列显示 profile 名）；删除 hermes agent 二次确认提示 profile 保留 |
+| **全链路 Trace 记录（迭代5，1.7.0）** | 每次对话记录完整链路：会话级聚合 `trace_conversations`（token 总量/模型/工具/skill/RAG/文件/状态/耗时）+ 步骤级明细 `trace_spans`（llm_call 真实 token+模型+耗时 / tool_call / mcp_call / rag_search 含 chunk 粒度 / skill_inject / file_op / cache_hit / error）。**非阻塞铁律**：写入失败只 log 不阻塞主链路；span input/output 截断 2000 字符；保留 N 天（默认 30，`settings`/`TRACE_RETENTION_DAYS` 可配，启动幂等清理）；hermes 后端 token 无 usage → NULL + `hermes_no_usage` 标注（不编造数字）。查询 `GET /api/trace/conversations[/{conv_id}]`（`system:admin`，不跨 agent 泄露） |
 | **API 与前端** | REST `/api/*` + WebSocket `/ws/chat/{agent}/{conv}`（流式）；纯原生 JS SPA（无框架） |
 | **可观测** | `/healthz` 健康检查（含 LLM/embedding/DB/记忆后端状态） |
 
@@ -170,7 +171,7 @@ tests/           pytest 套件（auth/agents/chat/rag/memory/mcp/longtext/ws）
 
 | 项 | 值 |
 |---|---|
-| 镜像 | `agp-platform:1.6.1`（build: `./src/Dockerfile`, python:3.12-slim；阶段六含 Hermes Agent 双后端接入，迭代4 含 MCP 双传输，1.6.1 含 BUG-011 MCP HTTP 通知 2xx 兼容。回滚锚点 `1.6.0`/`1.5.0`/`1.4.0`/`1.3.0` 保留） |
+| 镜像 | `agp-platform:1.7.0`（build: `./src/Dockerfile`, python:3.12-slim；1.7.0 含 TASK-057 全链路 trace 记录（trace_conversations/trace_spans + /api/trace 查询 + hermes 后端埋点）。回滚锚点 `1.6.1`/`1.6.0`/`1.5.0`/`1.4.0` 保留） |
 | 容器名 | `agp-app`，`restart: unless-stopped` |
 | 端口 | `8099:8099` |
 | 卷 | `agpdata:/app/data`（named volume，持久化 `agp.db`，sqlite 模式重启/重建不丢；**无需 chown 宿主目录**，属主由 Docker 管理，容器内 uid 1000 可直接写）；**Hermes（可选）**: `/home/hermes/.hermes:/home/hermes/.hermes`（宿主 hermes 运行时：venv + profiles + .env）+ `/home/hermes/.local/share/uv:/home/hermes/.local/share/uv`（venv python 符号链接目标）。未挂载的环境 hermes 功能优雅 503，custom 不受影响。显式 bind 卷用户见下方「从 bind 卷迁移到 named volume」 |
@@ -207,6 +208,37 @@ curl -s -X POST http://<host>:8099/api/ext/mcp \
 ```
 
 前端（MCP-Skills 页面）新建/编辑时选**传输类型**：`stdio`（本地命令）显示 command/args/env；`http`（Streamable HTTP 端点）显示 URL + headers 键值对。列表行带 `stdio` / `http` 传输标记；`tools/list` 测试按钮对两种传输通用（后端按行 `transport` 分流）。
+
+### 3.10 全链路 Trace 记录（迭代5，1.7.0）
+
+每次对话记录完整执行链路，用于"这次对话到底发生了什么"的可观测性。**双后端**（SQLite / PostgreSQL）幂等迁移：`trace_conversations`（会话级聚合，一个 conv 一行）+ `trace_spans`（步骤级明细，按 `seq` 时序），启动时自动建表（`CREATE IF NOT EXISTS`），旧库零回归。
+
+**Span 类型**（`span_type`）：
+- `llm_call`：每次 LLM 调用 → 真实 `tokens_in`/`tokens_out`（来自 provider usage，流式聚合末尾 usage chunk）+ 真实 `model` 名 + `duration_ms`
+- `tool_call` / `mcp_call`：插件 / MCP 工具调用（`mcp:server/tool` 命名）+ 入参/结果
+- `rag_search`：RAG 检索 → `rag_chunks` 字段记录 chunk 粒度（`knowledge_id`/`chunk_seq`/`score`/`preview`，前 5 个 chunk）
+- `skill_inject`：注入的 skill 摘要
+- `file_op`：中间文件路径（工具结果中的 `files`/`file_path` 字段 + hermes 后端 CLI 工作目录文件）
+- `cache_hit`：缓存命中直返
+- `error`：降级 / 异常（附错误信息）
+
+**非阻塞铁律**：所有 trace 写入包 `try/except`，失败只 `log` 不 `raise`——主聊天链路绝不被埋点阻塞（即使 trace 表损坏，对话仍正常返回）。span 的 `input`/`output` 截断 **2000 字符**，防 DB 膨胀。
+
+**保留策略**：trace 数据保留 N 天（默认 30，`settings` 表 `trace_retention_days` 或 `.env` `TRACE_RETENTION_DAYS` 可配，DB > env 优先级），启动时幂等清理过期行（失败只 log 不阻断启动）。
+
+**hermes 后端**：hermes CLI 无 token usage → `llm_call` span 的 `tokens_in`/`tokens_out` 记 **NULL**（不编造数字）+ `error` 字段注明 `hermes_no_usage`；CLI 工作目录文件变化记 `file_op`。
+
+**查询 API**（`system:admin`，安全优先，不跨 agent 泄露）：
+```bash
+# 会话聚合列表（按 started_at 倒序）
+curl -s -H "Authorization: Bearer <admin-token>" \
+  "http://localhost:8099/api/trace/conversations?limit=50" | jq
+
+# 会话详情（聚合 + 全部 spans，按 seq 升序）
+curl -s -H "Authorization: Bearer <admin-token>" \
+  "http://localhost:8099/api/trace/conversations/<conv_id>" | jq
+```
+非 admin（developer/user/viewer）访问 `/api/trace/*` 一律 **403**（不返回任何 trace 数据）。
 
 ## 4. 部署与启动
 
@@ -352,6 +384,8 @@ cd 02-development
 | `POST /api/rag/knowledge` + `/documents` + `/search` | 知识库 / 文档 / 检索 |
 | `GET /api/memory/l2` 等 | 三层记忆查询 |
 | `POST /api/longtext/...` | 长文本 4 策略 |
+| `GET /api/trace/conversations[?agent_id=&limit=&offset=]` | 链路追踪：会话聚合列表（`system:admin`） |
+| `GET /api/trace/conversations/{conv_id}` | 链路追踪：会话聚合 + 全部 spans（`system:admin`） |
 | `GET /healthz` | 健康检查 |
 
 详细设计与验收报告：[DESIGN.md](DESIGN.md)、[DEV_REPORT.md](DEV_REPORT.md)。

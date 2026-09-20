@@ -60,6 +60,10 @@ class Settings:
     STATIC_DIR = os.path.join(_SRC_DIR, "static")
     MAX_TOOL_ROUNDS = int(_get("MAX_TOOL_ROUNDS", "5"))
 
+    # 链路追踪（TASK-057 / 迭代5）：trace 数据保留天数（默认 30）。
+    # 优先级：settings 表 trace_retention_days > 此 env 默认（DB > env，DECISION-007 模式）。
+    TRACE_RETENTION_DAYS = int(_get("TRACE_RETENTION_DAYS", "30"))
+
     # 数据库后端（TASK-015 双后端：默认 sqlite 零依赖，postgres 可配置）
     # DB_BACKEND: sqlite | postgres（默认 sqlite；纯 .env 切换，业务代码零感知）
     DB_BACKEND = _get("DB_BACKEND", "sqlite").lower()

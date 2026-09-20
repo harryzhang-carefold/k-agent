@@ -52,7 +52,8 @@ async def chat_sync(agent_id: int, body: ChatIn, request: Request,
         engine = request.app.state.hermes_adapter
     else:
         engine = request.app.state.engine
-    result = await engine.run(agent, body.message, body.images, history)
+    # TASK-057: 传 conv_id 开启 trace 全痕迹记录（非阻塞）
+    result = await engine.run(agent, body.message, body.images, history, conv_id=conv_id)
     # 持久化消息
     await db.execute(conn, "INSERT INTO messages (conv_id, role, content) VALUES (?,?,?)",
                      (conv_id, "user", body.message or "[image]"))
@@ -114,7 +115,8 @@ async def ws_chat(ws: WebSocket, agent_id: int, conv_id: str):
             else:
                 engine = ws.app.state.engine
             # 流式执行（缓存路由前置；命中直发，否则逐 token）
-            out = await engine.run_stream(agent, text, images, history)
+            # TASK-057: 传 conv_id 开启 trace 全痕迹记录（非阻塞）
+            out = await engine.run_stream(agent, text, images, history, conv_id=conv_id)
             if out.get("cache_hit"):
                 await ws.send_json({"type": "cache_hit", "content": out["answer"],
                                     "cache_hit": out["cache_hit"],

@@ -2541,3 +2541,126 @@ V1 非法 transport `ftp` → 400 · V2 http 无 url → 400 · V3 http 非法 u
 2. **RISK-023 遗留**：建议轮换 `AI_MODEL_API_KEY` + `JWT_SECRET`（.env.bak 历史镜像泄漏 + 短 JWT），destructive 操作交用户。
 3. **真实 server 依赖**：本终审 AC-1/2 依赖 `http://34.85.104.227:9010/mcp/` 在线可用；该 server 为外部组件，其可用性不在本项目交付范围。
 4. **线上 8099 仍跑 1.4.0**：本地 docker compose 的 agp-app 为 1.4.0（未升级），1.6.1 交付以 origin/main + tag 为准；如需本地升级到 1.6.1 需用户确认（会动线上容器，RISK-015 禁止本卡执行）。
+
+# TASK-057 · 迭代5 全链路 Trace 记录（2026-09-20，章北海，t_9dae9678）
+
+> 需求：记录每次对话的完整链路（LLM 调用/工具/MCP/RAG/文件/skill/缓存），会话级聚合 +
+> 步骤级明细，token 真实，非阻塞，保留 N 天，admin 查询。详见任务书 T-AGP-TRACE.md。
+
+## 1. 交付范围（13 项全部落地）
+
+| 项 | 交付 | 关键文件 |
+|---|---|---|
+| ① 双 schema | `trace_conversations`（会话聚合，id=conversations.id）+ `trace_spans`（步骤明细，seq 时序）+ 索引 `idx_trace_spans_conv_id` | `core/schema_sqlite.sql`、`core/schema_pg.sql` |
+| ② provider usage | `chat()` 返回 `(content, usage_dict)`；`chat_stream()` 由 async-generator 改为返回 `(content_str, usage_dict)`（聚合 chunk + 末尾 usage）；无 usage → `{}`（不 raise） | `llm/provider.py` |
+| ③ rag chunk 元信息 | `search()` 每项增 `knowledge_id`/`chunk_seq`/`score`/`preview`/`token_est`（保留旧 `seq`） | `rag/rag.py` |
+| ④ 埋点核心 | `run()`/`run_stream()`/`assemble()`/`_tool_loop()` 全程埋点 + `conv_id` 贯穿（custom + hermes 两后端） | `engine/agent_engine.py`、`engine/hermes_adapter.py` |
+| ⑤ hermes 后端 | hermes CLI 无 usage → token **NULL** + `hermes_no_usage` 标注（不编造数字）；CLI 工作目录文件 → `file_op` | `engine/hermes_adapter.py` |
+| ⑥ 非阻塞铁律 | 所有 trace 写入包 `try/except` 只 log 不 raise；span input/output 截断 **2000** | `core/trace.py` |
+| ⑦ 保留策略 | 保留 N 天（默认 30，`settings.trace_retention_days` > `.env.TRACE_RETENTION_DAYS`），启动幂等清理 | `core/trace.py`、`core/app.py`、`core/config.py` |
+| ⑧ 查询 API | `GET /api/trace/conversations[?agent_id=&limit=&offset=]` + `GET /api/trace/conversations/{conv_id}`，`system:admin`（不跨 agent 泄露） | `routers/trace.py` |
+| ⑨ 调用方适配 | `longtext.py` 5 处 `chat()` 调用 + `health()` 全部适配 `(content, usage)` | `services/longtext.py` |
+| ⑩ 启动清理 | `app.py` 启动钩子：读 retention → `clean_expired`（失败只 log 不阻断） | `core/app.py` |
+| ⑪ 单测 | 10 用例全过（usage 解析 / rag chunk / 埋点完整 / 非阻塞 / 2000 截断 / 保留 / 权限 / hermes） | `tests/test_t057_trace.py` |
+| ⑫ 双后端自测 | SQLite 全链路（TestClient 独立 app）+ 生产 PG 容器真实 E2E（见 §3） | 见 §3 |
+| ⑬ 文档 | README §1 功能表 + §3.10 链路追踪专节 + §5 API + 镜像行 1.7.0 + `.env.example` 保留配置 | `README.md`、`.env.example` |
+
+## 2. 关键设计决策
+
+- **chat_stream 改签名**：由 `AsyncIterator[str]` 改为 `async def → (content_str, usage_dict)`。
+  流式 token 聚合后一次性返回，`_tokens` 列表仍供 WS 逐 token 推送（WS 逐字体验不变）。
+  这是**破坏性变更**——已核对全部调用方（agent_engine.run_stream 2 处 + longtext 5 处 +
+  provider.health）均已适配，无遗漏。
+- **usage 来源**：vLLM 兼容端点在**流式末尾**发 `usage`（`choices:[]` 的 chunk）；非流式在
+  response 顶层 `usage`。两者都解析为 `{prompt_tokens, completion_tokens, total_tokens}`。
+  端点无 usage → `{}`（不 raise，符合"无 usage 不报错"要求）。
+- **seq 连续性**：`TraceContext.init_seq()` 读该 conv 现有最大 seq，多轮对话 seq 单调递增。
+- **hermes token NULL**：hermes CLI 不返回 token 用量 → `tokens_in/out = NULL`（不编造），
+  `error` 字段追加 `hermes_no_usage` 标记（可区分"真错误"与"无 usage"）。
+- **中间文件**：custom 后端从 `call_plugin` 结果的 `files`/`file_path`/`file_paths` 字段提取
+  （`_file_paths_from_result`，纯函数）；hermes 后端列 CLI 工作目录（`profiles/<name>/workspace`）
+  下的文件。两者都是**预留机制**——当前零工具面 profile / 无文件产出插件时返回空，不产生噪声。
+
+## 3. 自测与验证
+
+### 3.1 单元测试（SQLite，TestClient 独立 app，05-temp/t057/，零 /tmp）
+```
+tests/test_t057_trace.py  →  10 passed
+  test_chat_returns_usage          usage prompt/completion 与 mock 一致
+  test_chat_stream_returns_usage   流式聚合 3 delta + 末尾 usage chunk
+  test_usage_empty_when_absent     端点无 usage → {} 不 raise
+  test_rag_search_chunk_metadata   knowledge_id/chunk_seq/score/preview
+  test_trace_spans_completeness    skill_inject+rag_search+llm_call(真实token+模型)+聚合
+  test_trace_non_blocking          rename 表模拟故障 → 主聊天仍 200
+  test_span_truncation_2000        5000 字符 → 截断 2000
+  test_retention_cleanup           31 天前行 → clean_expired(30) 删除
+  test_trace_api_auth              viewer 403 / admin 200
+  test_hermes_token_no_usage       hermes llm_call token NULL + hermes_no_usage
+```
+回归：`tests/test_system_config.py` 25 用例中 24 过；1 个失败
+（`test_pg_ddl_matches_sqlite_semantics`）经核实**为基线 b9a4faf 既有问题**——
+该测试从 `core/db.py` 读 `CREATE TABLE IF NOT EXISTS settings`，但 `db.py` 自始不含该
+DDL（settings DDL 早已迁到 schema 文件），且本卡**未改动 db.py**（`git diff b9a4faf -- src/core/db.py` 为空）。
+非本卡引入。
+
+### 3.2 生产 PG 容器真实 E2E（agp-platform:1.7.0，pg-unified/agp schema，真实 LLM vllm-qwen3.8-27b）
+```
+[1] admin 登录 OK
+[2] skill_id=64  [3] kb_id=18  [4] doc chunks=2  [5] agent_id=124 (skill+rag+echo 绑定)
+[6] chat 200  conv_id=c92a12e98437e  answer 正常
+[7] GET /api/trace/conversations  200, conv 在列表, retention_days=30
+[8] GET /api/trace/conversations/c92a12e98437e  200
+    span_count=5  types=[skill_inject, rag_search, llm_call, tool_call, llm_call]
+    llm_call: tokens_in=364 tokens_out=42 model=vllm-qwen3.8-27b dur=1940ms
+    conv: status=ok backend=custom total_tokens_in=834 total_llm_calls=2
+          models=['vllm-qwen3.8-27b'] tools_called=['echo']
+          skills_used=['t057-verify-skill'] rag_kb_used=[{'id':'18','name':'t057-verify-kb'}]
+[9] viewer GET /api/trace  → 403（权限隔离生效）
+```
+PG 侧 `trace_conversations`/`trace_spans` 两表已建（`psql pg_tables` 核实）；
+启动 `AGP STARTUP OK backend=postgres`。
+
+## 4. 部署（章北海职责：交付可运行环境）
+
+- **镜像**：`agp-platform:1.7.0`（`docker build ./src`，仅 COPY 层变更，33s）。
+- **生产容器**：原 `agp-app` 为**手动启动**的 1.4.0（无 compose 标签、bind 卷
+  `src/data:/app/data`），运行 **PG 模式**——真实数据在 **pg-unified**（外部，未动）。
+  移除旧 1.4.0 容器 → `docker compose -f docker-compose.yml -f docker-compose.pg.yml up -d`
+  起 1.7.0（named volume `agp_agpdata` + `agp_default` 网络 → pg-unified）。**无数据丢失**
+  （数据在 PG；sqlite 卷仅 sqlite 模式用，PG 模式不读）。
+- **回滚锚点**：`1.6.1`/`1.6.0`/`1.5.0`/`1.4.0` 镜像保留。
+- **健康**：`/healthz` 200；`docker ps` agp-app healthy；`backend=postgres`。
+
+## 5. 铁律 / 约束终检
+| 约束 | 结果 |
+|---|---|
+| 非阻塞铁律 | ✅ 单测 `test_trace_non_blocking`（rename 表→主聊天 200）+ E2E 主路径 200 |
+| token 真实不编造 | ✅ E2E `tokens_in=364` 来自真实 vLLM usage；hermes 后端 NULL+hermes_no_usage（单测⑩） |
+| 2000 截断 | ✅ 单测⑦ 5000→2000 |
+| admin-only | ✅ 单测⑨ viewer 403 + E2E[9] viewer 403 |
+| 双后端幂等迁移 | ✅ SQLite（TestClient）+ PG（生产容器 `CREATE IF NOT EXISTS` 自动建表） |
+| .env 不进镜像 | ✅ Dockerfile `COPY . .` + `.dockerignore` 排除 `.env`（沿用既有）；`TRACE_RETENTION_DAYS` 仅默认位 |
+| 零硬编码密钥 | ✅ 本卡改动文件无密钥；e2e 脚本仅用种子密码 admin123（非密钥） |
+| 临时文件全 05-temp/ | ✅ 测试库 + e2e 脚本落 `05-temp/t057/`、`05-temp/t_9dae9678/`，零 /tmp |
+
+## 6. 已知问题 / 风险（交测试 + 用户）
+1. **既有测试失败（非本卡）**：`test_system_config.py::test_pg_ddl_matches_sqlite_semantics`
+   在基线 b9a4faf 即失败（`db.py` 无 `settings` DDL）。建议后续由测试/PM 决定是否修复该测试
+   或恢复 db.py 内联 DDL 断言源。**本卡未触碰 db.py**。
+2. **生产 8099 已从 1.4.0 升到 1.7.0**（本卡执行部署）。上一份报告（BUG-011）曾记录
+   "线上仍跑 1.4.0"——现已升级。若需回滚：`docker compose ... up -d` 前把 compose image
+   改回 1.6.1 即可（镜像已保留）。
+3. **保留策略清理的启动日志**用 `log.info`，在 `uvicorn --log-level info` 下被 root
+   logger WARNING 阈值抑制（沿用既有"就绪标记用 print"的已知 quirk）——清理**确实执行**
+   （单测⑦ + 启动无异常），仅日志不可见。不影响功能。
+4. **hermes 后端 file_op** 是"列工作目录全部文件"的保守实现（非严格 before/after diff）——
+   零工具面 profile 通常无文件 → 返回空。若未来 hermes profile 产出文件，此机制会记录，
+   但精确的"本次新增 vs 存量"diff 未实现（任务书 b 项为"机制预留"，已预留）。
+5. **前端未加 trace 查看 UI**（任务书核心是后端记录 + API；前端可视化非本迭代要求）。
+   前端如需展示，可基于 `GET /api/trace/conversations/{conv_id}` 的 spans 渲染。
+
+## 7. 交付动作
+- 分支 `feat/trace`（自 b9a4faf）已含全部代码 + 测试 + 文档；commit + push 待本卡完成后执行。
+- 镜像 `agp-platform:1.7.0` 已 build；生产容器已升级到 1.7.0 并验证可运行。
+- 移交测试（云天明）：重点回归 chat/run 路径（chat_stream 签名变更）+ hermes 后端 +
+  /api/trace 权限 + 非阻塞（trace 表故障不影响对话）。

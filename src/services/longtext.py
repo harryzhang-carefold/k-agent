@@ -89,7 +89,7 @@ async def map_reduce(conn, text: str) -> dict:
     map_results = []
     for i, c in enumerate(chunks):
         try:
-            out = await llm.chat([{"role": "user", "content": MAP_PROMPT + c}],
+            out, _usage = await llm.chat([{"role": "user", "content": MAP_PROMPT + c}],
                                  temperature=0, max_tokens=600)
             map_results.append({"chunk": i, "items": _parse_json_array(out)})
         except LLMError as e:
@@ -99,7 +99,7 @@ async def map_reduce(conn, text: str) -> dict:
     reduce_items = []
     if all_items:
         try:
-            out = await llm.chat([{"role": "user",
+            out, _usage = await llm.chat([{"role": "user",
                                    "content": REDUCE_PROMPT + json.dumps(all_items, ensure_ascii=False)}],
                                  temperature=0, max_tokens=800)
             reduce_items = _parse_json_array(out)
@@ -135,7 +135,7 @@ async def incremental_graph(conn, text: str, center_hint: str = "") -> dict:
     triples_total, triples_valid = 0, 0
     for c in chunks:
         try:
-            out = await llm.chat([{"role": "user", "content": TRIPLET_PROMPT + c}],
+            out, _usage = await llm.chat([{"role": "user", "content": TRIPLET_PROMPT + c}],
                                  temperature=0, max_tokens=600)
             trs = _parse_json_array(out)
         except LLMError:
@@ -203,7 +203,7 @@ async def critique_refine(conn, text: str, max_rounds: int = 5) -> dict:
             f"\n\n[第{r-1}轮校验错误] {last_errors}\n请根据以上错误信息重新生成，确保满足全部格式与业务约束。"
             if r > 1 else "")
         try:
-            out = await llm.chat([{"role": "user", "content": prompt}],
+            out, _usage = await llm.chat([{"role": "user", "content": prompt}],
                                  temperature=0, max_tokens=700)
         except LLMError as e:
             round_log.append({"round": r, "ok": False, "error": f"LLM: {str(e)[:100]}"})
@@ -295,5 +295,5 @@ async def _llm_semantic_convert(structured: dict) -> list:
         "下面是按患者+日期聚合的结构化检验数据（JSON）。请生成 3 个高质量医学 QA 对，"
         "只理解医学语义并生成，不要重述全部数据。输出 JSON 数组，每项 {question, answer, source_field}。"
         "只输出 JSON。\n数据：\n" + json.dumps(structured, ensure_ascii=False)[:3000])
-    out = await llm.chat([{"role": "user", "content": prompt}], temperature=0, max_tokens=500)
+    out, _usage = await llm.chat([{"role": "user", "content": prompt}], temperature=0, max_tokens=500)
     return _parse_json_array(out)

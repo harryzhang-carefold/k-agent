@@ -12,10 +12,12 @@ Prompt 布局（prefix caching 规则5，AC-18 可断言）：
 """
 import json
 import re
+import time
 from core import db
 from core.config import S
 from core.errors import LLMError
 from core import stats
+from core import trace as trace_mod
 from llm import provider as llm
 from rag import rag
 from memory import backend as memory
@@ -36,6 +38,39 @@ TOOL_NAMES_BLOCK = (
 )
 
 
+def _file_paths_from_result(res: dict) -> list[str]:
+    """从 call_plugin 结果提取中间文件路径（任务书 §3 中间文件 a 项）。
+
+    识别结果中的 files / file_path 字段（字符串或字符串列表）。无则返回 []。
+    非阻塞的纯函数，供埋点调用。
+    """
+    if not isinstance(res, dict):
+        return []
+    paths: list[str] = []
+    for key in ("files", "file_path", "file_paths"):
+        v = res.get(key)
+        if v is None:
+            continue
+        if isinstance(v, str):
+            if v:
+                paths.append(v)
+        elif isinstance(v, list):
+            for item in v:
+                if isinstance(item, str) and item:
+                    paths.append(item)
+                elif isinstance(item, dict):
+                    p = item.get("path") or item.get("file_path")
+                    if isinstance(p, str) and p:
+                        paths.append(p)
+    # 去重保序
+    seen, out = set(), []
+    for p in paths:
+        if p not in seen:
+            out.append(p)
+            seen.add(p)
+    return out
+
+
 class AgentEngine:
     def __init__(self, app):
         self.app = app
@@ -47,8 +82,10 @@ class AgentEngine:
     # ---------------- prompt assembly ----------------
     async def assemble(self, agent: dict, text: str | None = "",
                        history: list[dict] | None = None,
-                       include_tools: bool = True) -> list[dict]:
-        """返回 messages（单 system + 历史 + 请求）。固定内容在最左，请求在最右。"""
+                       include_tools: bool = True,
+                       ctx=None) -> list[dict]:
+        """返回 messages（单 system + 历史 + 请求）。固定内容在最左，请求在最右。
+        ctx: 可选 TraceContext（TASK-057 埋点）；有则记录 skill_inject / rag_search span。"""
         conn = self.conn
         system = agent["system_prompt"]
 
@@ -61,6 +98,11 @@ class AgentEngine:
         if skill_rows:
             system += "\n\n[Skills 指令]\n" + "\n".join(
                 f"## {s['name']}\n{s['content']}" for s in skill_rows)
+            # TASK-057 埋点：每个注入 skill → span skill_inject
+            for s in skill_rows:
+                if ctx:
+                    await ctx.record_skill_inject(
+                        s["name"], (s["content"] or "")[:400])
 
         # 工具 schema（固定左侧）
         tool_names = [r["ref_id"] for r in await db.fetchall(
@@ -78,13 +120,23 @@ class AgentEngine:
             conn, "SELECT ref_id FROM agent_bindings WHERE agent_id=? AND type='rag'",
             (agent["id"],))]
         if rag_ids and text:
-            ctx = []
+            ctxs = []
             for rid in rag_ids:
                 res = await rag.search(conn, int(rid), text, top_k=3)
                 if res:
-                    ctx.append(rag.build_context(res))
-            if ctx:
-                system += "\n\n[RAG 知识库上下文]\n" + "\n\n".join(ctx)
+                    ctxs.append(rag.build_context(res))
+                    # TASK-057 埋点：每个 kb → span rag_search（rag_chunks 携带 chunk 粒度）
+                    if ctx:
+                        kb_row = await db.fetchone(
+                            conn, "SELECT name FROM rag_knowledge WHERE id=?", (int(rid),))
+                        kb_name = kb_row["name"] if kb_row else str(rid)
+                        chunks = [{"knowledge_id": int(rid),
+                                   "chunk_seq": c.get("chunk_seq", c.get("seq")),
+                                   "score": c.get("score"),
+                                   "preview": c.get("preview", "")} for c in res]
+                        await ctx.record_rag_search(int(rid), kb_name, text, chunks)
+            if ctxs:
+                system += "\n\n[RAG 知识库上下文]\n" + "\n\n".join(ctxs)
 
         # 记忆上下文（左）
         mem_ctx = await self._memory_context(agent)
@@ -136,10 +188,21 @@ class AgentEngine:
 
     async def run(self, agent: dict, text: str, images: list[dict] | None = None,
                   history: list[dict] | None = None,
-                  on_token=None) -> dict:
-        """同步执行一轮 agent。返回 {answer, llm_calls, cache_hit, route_events, tool_calls}"""
+                  on_token=None, conv_id: str | None = None) -> dict:
+        """同步执行一轮 agent。返回 {answer, llm_calls, cache_hit, route_events, tool_calls}
+        TASK-057: conv_id 传入则开启 trace 上下文并记录全痕迹（非阻塞，绝不因埋点失败影响主链路）。"""
         conn = self.conn
         agent_key = f"agent:{agent['id']}"
+        # TASK-057: 开 trace 上下文（非阻塞：建/初始化失败则 ctx=None，主链路照常）
+        ctx = None
+        if conv_id:
+            try:
+                ctx = trace_mod.TraceContext(conn, conv_id, agent["id"],
+                                             agent.get("name"),
+                                             (agent.get("backend") or "custom").lower())
+                await ctx.init_seq()
+            except Exception:
+                ctx = None
         # 绑定 MCP server 行（供 mcp_call 插件路由）
         mcp_row = None
         for b in await db.fetchall(conn, "SELECT * FROM agent_bindings WHERE agent_id=? AND type='mcp'",
@@ -163,12 +226,19 @@ class AgentEngine:
             await self._l0(agent["id"], text or "[image]", decision["answer"])
             if on_token:
                 await on_token(decision["answer"])
+            # TASK-057 埋点：缓存命中 → span cache_hit + 聚合行
+            if ctx:
+                await ctx.record_cache_hit(decision.get("cache_hit"))
+                await ctx.finish(status="ok")
             return result
 
         # ---- LLM 路径（prefix caching 布局由 assemble 保证）----
         try:
-            messages = await self.assemble(agent, text, history)
+            messages = await self.assemble(agent, text, history, ctx=ctx)
         except Exception as e:
+            if ctx:
+                await ctx.record_error("assemble", str(e))
+                await ctx.finish(status="error", error=str(e))
             return {"answer": f"[系统错误] prompt 组装失败: {e}", "llm_calls": 0,
                     "cache_hit": None, "route_events": decision.get("route_events", []),
                     "sub_requests": decision.get("sub_requests", []), "tool_calls": [],
@@ -176,13 +246,16 @@ class AgentEngine:
 
         before = stats.snapshot()["llm_calls"]
         try:
-            answer = await self._tool_loop(messages, agent, mcp_row, on_token)
+            answer = await self._tool_loop(messages, agent, mcp_row, on_token, ctx=ctx)
         except LLMError as e:
             # 受控降级（AC-14）：不崩溃、不裸 500
             result["llm_calls"] = stats.snapshot()["llm_calls"] - before
             result["answer"] = f"[LLM 降级应答] 模型服务暂不可用（{e}）。请检查 LLM_BASE_URL / AI_MODEL_API_KEY。"
             result["degraded"] = True
             await self._l0(agent["id"], text or "[image]", result["answer"])
+            if ctx:
+                await ctx.record_error("llm_degraded", str(e))
+                await ctx.finish(status="degraded", error=str(e))
             return result
 
         result["llm_calls"] = stats.snapshot()["llm_calls"] - before
@@ -193,6 +266,8 @@ class AgentEngine:
         # 下次同图请求直返（cache_hit=md5, llm_calls=0）
         await cache_router.remember_images(images, answer, decision.get("sub_requests"))
         await self._l0(agent["id"], text or "[image]", answer)
+        if ctx:
+            await ctx.finish(status="ok")
         return result
 
     # ---------------- endpoint 解析（TASK-029 / 需求1） ----------------
@@ -231,7 +306,7 @@ class AgentEngine:
         return kw
 
     async def _tool_loop(self, messages: list[dict], agent: dict, mcp_row: dict | None,
-                         on_token=None) -> str:
+                         on_token=None, ctx=None) -> str:
         args = {"temperature": agent["temperature"], "max_tokens": agent["max_tokens"],
                 "top_p": agent["top_p"]}
         # TASK-029: endpoint 覆盖 + BUG-007 回退（同步路径）。
@@ -245,9 +320,21 @@ class AgentEngine:
             args.update(_epk)
         elif agent.get("model"):
             args["model"] = S.LLM_MODEL
+        # 埋点用：模型名（args.model 经 endpoint 解析后是真实 LLM 模型标识）
+        model_name = args.get("model") or S.LLM_MODEL
         content = ""
         for _round in range(S.MAX_TOOL_ROUNDS):
-            content = await llm.chat(messages, **args)
+            _t0 = time.monotonic()
+            content, usage = await llm.chat(messages, **args)
+            _dur = int((time.monotonic() - _t0) * 1000)
+            # TASK-057 埋点：每次 LLM 调用 → span llm_call（真实 token/模型/耗时）
+            if ctx:
+                last_user = self._last_user_text(messages)
+                await ctx.record_llm_call(
+                    model_name, last_user, content,
+                    tokens_in=usage.get("prompt_tokens") if usage else None,
+                    tokens_out=usage.get("completion_tokens") if usage else None,
+                    duration_ms=_dur)
             tc = self.extract_tool_call(content)
             if tc is None:
                 if on_token:
@@ -259,11 +346,31 @@ class AgentEngine:
                 messages.append({"role": "user", "content":
                                  f"(上一轮你要求调用未知工具 {name}。可用工具: {plugin_registry_names}。请改调可用工具或直接回答用户问题。)"})
                 continue
-            ctx = {}
+            _t1 = time.monotonic()
+            plugin_ctx = {}
             if mcp_row:
                 # TASK-053 迭代4: 传全行（含 transport/url/headers）供 mcp_call 按传输分流
-                ctx = _mcp_ctx(mcp_row)
-            res = await plugin_registry.call_plugin(name, tc.get("arguments") or {}, ctx)
+                plugin_ctx = _mcp_ctx(mcp_row)
+            res = await plugin_registry.call_plugin(name, tc.get("arguments") or {}, plugin_ctx)
+            _dur2 = int((time.monotonic() - _t1) * 1000)
+            # TASK-057 埋点：工具/MCP 调用 → span tool_call / mcp_call
+            if ctx:
+                is_mcp = (name == "mcp_call")
+                if is_mcp:
+                    server = (mcp_row.get("name") if mcp_row else None)
+                    tool_name = (tc.get("arguments") or {}).get("name", "")
+                    await ctx.record_mcp_call(server, tool_name, tc.get("arguments"),
+                                              res, duration_ms=_dur2,
+                                              status="ok" if res.get("ok") else "error",
+                                              error=None if res.get("ok") else str(res.get("error")))
+                else:
+                    await ctx.record_tool_call(name, tc.get("arguments"), res,
+                                               duration_ms=_dur2,
+                                               status="ok" if res.get("ok") else "error",
+                                               error=None if res.get("ok") else str(res.get("error")))
+                # 中间文件：call_plugin 结果含 files/file_path 字段 → file_op span
+                for f in _file_paths_from_result(res):
+                    await ctx.record_file_op(f)
             if on_token:
                 await on_token(f"[tool_call:{name}] ")
             messages.append({"role": "assistant", "content": content})
@@ -275,11 +382,30 @@ class AgentEngine:
             await on_token(content)
         return content
 
+    @staticmethod
+    def _last_user_text(messages: list[dict]) -> str | None:
+        """取最后一条 user 消息文本（llm_call span 的 input 摘要）。"""
+        for m in reversed(messages):
+            if m.get("role") == "user":
+                return (m.get("content") or "")[:2000]
+        return None
+
     async def run_stream(self, agent: dict, text: str, images: list[dict] | None = None,
-                         history: list[dict] | None = None) -> dict:
-        """WS 流式：先走缓存路由（命中直发），否则 LLM 流式逐 token。"""
+                         history: list[dict] | None = None,
+                         conv_id: str | None = None) -> dict:
+        """WS 流式：先走缓存路由（命中直发），否则 LLM 流式逐 token。
+        TASK-057: conv_id 传入则记录 trace（流式 usage 有则记、无则 0 不报错）。"""
         conn = self.conn
         agent_key = f"agent:{agent['id']}"
+        ctx = None
+        if conv_id:
+            try:
+                ctx = trace_mod.TraceContext(conn, conv_id, agent["id"],
+                                             agent.get("name"),
+                                             (agent.get("backend") or "custom").lower())
+                await ctx.init_seq()
+            except Exception:
+                ctx = None
         decision = await cache_router.route_request(agent_key, text, images)
         out = {"llm_calls": 0, "cache_hit": decision.get("cache_hit"),
                "route_events": decision.get("route_events", []),
@@ -287,6 +413,9 @@ class AgentEngine:
         if decision["hit"]:
             out["answer"] = decision["answer"]
             await self._l0(agent["id"], text or "[image]", decision["answer"])
+            if ctx:
+                await ctx.record_cache_hit(decision.get("cache_hit"))
+                await ctx.finish(status="ok")
             return out
         mcp_row = None
         for b in await db.fetchall(conn, "SELECT * FROM agent_bindings WHERE agent_id=? AND type='mcp'",
@@ -295,8 +424,11 @@ class AgentEngine:
             if mcp_row:
                 break
         try:
-            messages = await self.assemble(agent, text, history)
+            messages = await self.assemble(agent, text, history, ctx=ctx)
         except Exception as e:
+            if ctx:
+                await ctx.record_error("assemble", str(e))
+                await ctx.finish(status="error", error=str(e))
             out["answer"] = f"[系统错误] prompt 组装失败: {e}"
             out["degraded"] = True
             return out
@@ -311,34 +443,71 @@ class AgentEngine:
             args.update(_epk)
         elif agent.get("model"):
             args["model"] = S.LLM_MODEL
+        model_name = args.get("model") or S.LLM_MODEL
         before = stats.snapshot()["llm_calls"]
         parts: list[str] = []
         try:
-            async for tok in llm.chat_stream(messages, **args):
-                parts.append(tok)
-                out.setdefault("_tokens", []).append(tok)
+            _t0 = time.monotonic()
+            content, usage = await llm.chat_stream(messages, **args)
+            _dur = int((time.monotonic() - _t0) * 1000)
+            parts = list(content or "")
+            out.setdefault("_tokens", []).extend(list(content or ""))
+            if ctx:
+                await ctx.record_llm_call(
+                    model_name, self._last_user_text(messages), content,
+                    tokens_in=usage.get("prompt_tokens") if usage else None,
+                    tokens_out=usage.get("completion_tokens") if usage else None,
+                    duration_ms=_dur)
         except LLMError as e:
             out["llm_calls"] = stats.snapshot()["llm_calls"] - before
             out["answer"] = f"[LLM 降级应答] 模型服务暂不可用（{e}）。"
             out["degraded"] = True
             await self._l0(agent["id"], text or "[image]", out["answer"])
+            if ctx:
+                await ctx.record_error("llm_degraded", str(e))
+                await ctx.finish(status="degraded", error=str(e))
             return out
         out["llm_calls"] = stats.snapshot()["llm_calls"] - before
         out["answer"] = "".join(parts)
         # 流式路径若 LLM 以 tool_call 应答：同步补一轮工具执行（最多1轮）
         tc = self.extract_tool_call(out["answer"])
         if tc is not None:
+            _t1 = time.monotonic()
             res = await plugin_registry.call_plugin(
                 tc.get("name"), tc.get("arguments") or {},
                 _mcp_ctx(mcp_row))
+            _dur2 = int((time.monotonic() - _t1) * 1000)
+            if ctx:
+                if tc.get("name") == "mcp_call":
+                    server = (mcp_row.get("name") if mcp_row else None)
+                    tool_name = (tc.get("arguments") or {}).get("name", "")
+                    await ctx.record_mcp_call(server, tool_name, tc.get("arguments"), res,
+                                              duration_ms=_dur2,
+                                              status="ok" if res.get("ok") else "error",
+                                              error=None if res.get("ok") else str(res.get("error")))
+                else:
+                    await ctx.record_tool_call(tc.get("name"), tc.get("arguments"), res,
+                                               duration_ms=_dur2,
+                                               status="ok" if res.get("ok") else "error",
+                                               error=None if res.get("ok") else str(res.get("error")))
+                for f in _file_paths_from_result(res):
+                    await ctx.record_file_op(f)
             messages.append({"role": "assistant", "content": out["answer"]})
             messages.append({"role": "user",
                              "content": f"[tool] {tc.get('name')} 执行结果: {json.dumps(res, ensure_ascii=False)}\n请基于以上工具结果回答用户原始问题。"})
             parts2 = []
             before2 = stats.snapshot()["llm_calls"]
-            async for tok in llm.chat_stream(messages, **args):
-                parts2.append(tok)
-                out.setdefault("_tokens", []).append(tok)
+            _t3 = time.monotonic()
+            content2, usage2 = await llm.chat_stream(messages, **args)
+            _dur3 = int((time.monotonic() - _t3) * 1000)
+            parts2 = list(content2 or "")
+            out.setdefault("_tokens", []).extend(list(content2 or ""))
+            if ctx:
+                await ctx.record_llm_call(
+                    model_name, self._last_user_text(messages), content2,
+                    tokens_in=usage2.get("prompt_tokens") if usage2 else None,
+                    tokens_out=usage2.get("completion_tokens") if usage2 else None,
+                    duration_ms=_dur3)
             out["llm_calls"] += stats.snapshot()["llm_calls"] - before2
             out["answer"] = "".join(parts2) or out["answer"]
             out["tool_calls"] = [tc.get("name")]
@@ -346,6 +515,8 @@ class AgentEngine:
         # 写 L1 图片 MD5 缓存（AC-51，与 run() 对齐）
         await cache_router.remember_images(images, out["answer"], decision.get("sub_requests"))
         await self._l0(agent["id"], text or "[image]", out["answer"])
+        if ctx:
+            await ctx.finish(status="ok")
         return out
 
     async def _l0(self, agent_id, input_text, output_text):
