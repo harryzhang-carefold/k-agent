@@ -2740,3 +2740,57 @@ PG 侧 `trace_conversations`/`trace_spans` 两表已建（`psql pg_tables` 核�
 - 分支 `feat/trace` 累计 commit（在 TASK-057 415a4e5 之上）：本卡 commit = 前端 trace tab + style + README。
 - push origin feat/trace（**不 push main、不 tag**）。
 - 移交测试（云天明）：重点 ① admin 登录后 MCP-Skills 页底部 trace 面板三态 ② 详情时间线 rag chunk 展开 ③ 非 admin 无权限 ④ 原 4 个 panel 零回归。
+
+
+# TASK-060 · 迭代5 PM 独立黑盒终审 + merge main + push + tag 1.7.0 + 交付（2026-09-21，褚岩，t_c2122a1f）
+
+**终审方法：独立黑盒**（干净 `git archive 1ff926f` → 独立 build `agp-platform:1.7.0`（md5 逐字节一致）→ RISK-015 隔离容器（独立名+端口 + 独立 t060-net + 独立 PG）→ 自写 harness 独立复现，**不采信 059 / run190 上游自测**）。
+
+## 1. 干净 build 一致性
+- `git archive feat/trace@1ff926f` → build `agp-platform:1.7.0`（Dockerfile 未改，named-volume 预建+chown 1000 生效）。
+- 16 关键文件（trace 双表/schema/埋点/provider/rag/engine/hermes/ext.js/style.css/api2/db 等）md5 **逐字节一致**（源树 archive == 新镜像）。
+- ⚠ 发现：线上 `agp-platform:1.7.0` 旧镜像（TASK-057 build）的 `static/ext.js`(986a…)/`style.css`(3389…) 与 058 前端不符 → **重新 build 1.7.0** 后 ext.js/style.css = archive（053f…/2343…），前端 trace 面板随镜像分发。
+
+## 2. 三项核心独立复现（干净 1.7.0 容器 t060f-sqlite:18560 / 经 t060b-proxy ground-truth 透明代理 → vLLM 34.121.9.233:4000）
+| 核心 | 结果 | 证据 |
+|---|---|---|
+| ① token 真实（误差 0） | ✅ | llm_call span token `716/17`、`839/512` == 代理 upstream usage == 同 prompt 直连 vLLM usage（三方一致，误差 0）。模型 `vllm-qwen3.8-27b`。 |
+| ② rag 到 chunk | ✅ | rag_search span `rag_chunks` 3 chunk 粒度：`knowledge_id=1 / chunk_seq=0,1,2 / score=0.1055,0.158,0.2237 / preview`（具体到 chunk）。 |
+| ③ 非阻塞 | ✅ | rename trace_spans/trace_conversations 模拟写入故障 → 主聊天 **200 + degraded=false + 真实答案**；新增 6 条 `trace ... 写入失败（忽略，不阻塞主链路）: OperationalError: no such table` 日志；恢复后 trace 正常（span_count=5）。 |
+
+## 3. 10 项 AC 独立抽验（全部独立执行，非采信 059）
+| # | AC | 结果 | 证据 |
+|---|---|---|---|
+| 1 | 埋点完整性 | ✅ | 会话 spans = skill_inject + rag_search(含 chunk) + llm_call(真实 token+模型) + tool_call(get_time) + 聚合行 total_in=1555/llm_calls=2/status=ok |
+| 2 | token 真实 | ✅ | 见核心①（span==proxy==vLLM 直调 误差 0） |
+| 3 | 流式 ws | ✅ | `/ws/chat/{aid}/{conv}` 241 token 事件 + done；trace 完整（skill_inject+rag_search+llm_call+mcp_call+llm_call），流式 usage 有值(711/45, 827/74) |
+| 4 | hermes 后端 | ✅ | hermes agent 一轮 200 + 真实回答不崩；llm_call token NULL + 标注 `hermes_no_usage`（不编造）；conv backend=hermes |
+| 5 | 中间文件 | ✅ | 测试专用 fileop mock 插件 → file_op span 出现，name=`/app/data/intermediate/t060f_test_output.txt`，聚合 files_created 一致，容器内 ls 确认文件真实存在 |
+| 6 | 非阻塞 | ✅ | 见核心③ |
+| 7 | 零回归 | ✅ | 干净 1.7.0 容器内 `pytest tests/` = **131 passed / 8 failed**；10 项 trace 测试(test_t057_trace)全 PASS；8 失败全部**预存/环境性**（db.py marker 预存 bug×3 / 干净 archive 无 .env 缓存路径×1 / 容器路径布局 /app/src→/app 致 index.html 路径×2 / mcp demo 脚本解析×2），与 059 基线 5 个预存失败同属一类，**零新增回归**。feat/trace 未改 db.py/cache_router.py/memory/。 |
+| 8 | 性能 | ✅ | 单 span 写入 P95=0.526ms（本地 sqlite 真实 trace_spans 表，n=120，max=0.699ms）< 50ms |
+| 9 | 保留策略 | ✅ | 插入 31/29/1 天前行 → `clean_expired(30)` 后：31 天前被清、29 天前保留、1 天前保留（CLEANED=1） |
+| 10 | 双 schema | ✅ | sqlite 全量过；独立 PG 容器（t060f-pg + 独立 t060f-pgdb）核心路径全过：llm 真实 token(701,824)+模型 + rag chunk(3) + skill/tool + 聚合(total_in=1525) |
+
+**判定：PASS（P0=0 / P1=0 / P2=0）。**
+
+## 4. 约束终检（RISK-015）
+- [x] RISK-015 隔离：全部测试/终审容器 `docker run` 独立名+端口（t060f-sqlite:18560 / t060f-pg:18562 / t060f-fileop:18565 / t060f-regress:18566 / 独立 t060b-proxy / t060f-pgdb），独立 t060-net，禁动线上。
+- [x] 线上零改动：前后 `docker ps`（剔除 t060*）逐条一致（agp-app/astm-*/gw-nginx/pg-unified 状态/镜像/端口未变），8099 healthz 全程 200。
+- [x] 零硬编码密钥：`git diff b9a4faf..1ff926f -- src/` 新增行密钥模式扫描 **0 命中**；git 仅追踪 `src/.env.example`（无真实 .env）。
+- [x] .env 不进镜像：`.dockerignore` 排除 `.env` + `data/`；镜像内探针 `find /app -name .env` 无结果（仅 seed.py 等代码）。
+- [x] 临时文件全 05-temp/t060/（含 t060_run191/ 本次 harness/evidence/baseline），零 /tmp。
+- [x] 不检查 CI / 不验证 GCP（DECISION-024 口径，用户 2026-09-18 拍板）。
+
+## 5. 交付动作
+- merge `feat/trace` → `main`；`git push origin main`；`git push origin tag 1.7.0`。
+- 文档核对：README §3.10 链路追踪节（行243）+ §5 API trace 行 + 镜像行 1.7.0（行174，回滚锚点 1.6.1/1.6.0/1.5.0/1.4.0）；DEV_REPORT §TASK-057/058/060；compose image `agp-platform:1.7.0`。
+- 回滚锚点 1.6.1（BUG-011 交付）。
+
+## 6. 剩余风险清单（交用户）
+1. **GCP 8099 未验证**（DECISION-024 口径，本卡不查 CI/不验 GCP）：1.7.0 已 push + tag，CI 自动触发部署；异常需用户侧诊断（RISK-027 遗留：本机 PAT 读不了 CI 日志）。
+2. **hermes 后端 token = NULL**（hermes CLI 无 usage，标注 `hermes_no_usage`，非编造）；前端 token 列显示 "—"。
+3. **30 天保留依赖启动清理**（启动时幂等 clean_expired，非实时）；运行期新增过期行需下次重启才清。
+4. **线上 8099 需重新 build 1.7.0 镜像**才能加载 058 trace 前端（本次已 build 干净 1.7.0 镜像）；本地 compose 升级会动线上 agp-app（RISK-015 禁止本卡执行，需用户确认）。
+5. **RISK-023 遗留**：建议轮换 AI_MODEL_API_KEY + JWT_SECRET（destructive，交用户）。
+
